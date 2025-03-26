@@ -22,11 +22,13 @@ from io import StringIO, BytesIO
 
 # Load API keys from environment variables
 load_dotenv()
+
+#get the API keys from the environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # OpenAI and Groq Clients
-clientGRQ = Groq(api_key=GROQ_API_KEY)
+# clientGRQ = Groq(api_key=GROQ_API_KEY)
 clientOAI = OpenAI(api_key=OPENAI_API_KEY)
 
 # Function to execute JS to access url
