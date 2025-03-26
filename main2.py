@@ -1928,7 +1928,7 @@ def get_embeddings_batch(texts: List[str], batch_size: int = 20) -> List[List[fl
 
 if __name__ == "__main__":
     # OpenAI API key
-    openai.api_key = "YOUR_OPENAI_API_KEY_HERE"
+    openai.api_key = ""
     
     # Configuration
     config = {
