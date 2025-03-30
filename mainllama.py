@@ -1049,7 +1049,7 @@ def initialize_vector_db(db_dir: str) -> chromadb.PersistentClient:
     # Get or create the collection for documents
     try:
         collection = client.get_or_create_collection(
-            name="rag_documents",
+            name="msi_documents",
             metadata={"hnsw:space": "cosine"}  # Using cosine similarity
         )
         logger.info(f"Initialized vector database at {db_dir}")
@@ -1540,8 +1540,8 @@ def embed_and_index_documents(documents: List[Document],
     # DATABASE INITIALIZATION:
     # Get or create the collection for storing document embeddings
     # This is the primary storage for the vector search capabilities
-    collection = client.get_collection("rag_documents")
-    logger.debug(f"Connected to ChromaDB collection: rag_documents")
+    collection = client.get_collection("msi_documents")
+    logger.debug(f"Connected to ChromaDB collection: msi_documents")
     
     # METADATA STORAGE SETUP:
     # ChromaDB has limitations on metadata complexity, so we use a separate
@@ -1688,7 +1688,6 @@ def embed_and_index_documents(documents: List[Document],
     # Log final indexing statistics
     logger.info(f"Successfully indexed {len(documents)} documents in the vector database")
 
-
 def search_cache_key_fn(context, parameters):
     """
     Generate a cache key for the semantic search function that excludes
@@ -1717,8 +1716,8 @@ def search_cache_key_fn(context, parameters):
     name="semantic_search",                        # Task name displayed in Prefect UI
     description="Perform semantic search in the vector database",
     # No retries specified - search failures don't benefit as much from retries as API calls
-    cache_key_fn=search_cache_key_fn,             # Use custom cache key function
-    cache_expiration=timedelta(minutes=30)        # Cache results for 30 minutes
+    # cache_key_fn=search_cache_key_fn,             # Use custom cache key function
+    # cache_expiration=timedelta(minutes=30)        # Cache results for 30 minutes
 )
 def semantic_search(query: str, 
                    client: chromadb.PersistentClient, 
@@ -1746,8 +1745,8 @@ def semantic_search(query: str,
     # VECTOR DATABASE CONNECTION:
     # Retrieve the collection that stores our document embeddings
     # This is where all the vector representations and simple metadata are stored
-    logger.debug(f"Connecting to vector database collection 'rag_documents'")
-    collection = client.get_collection("rag_documents")
+    logger.debug(f"Connecting to vector database collection 'msi_documents'")
+    collection = client.get_collection("msi_documents")
     
     # Log the count of documents in collection
     doc_count = collection.count()
@@ -2184,7 +2183,7 @@ def process_query(query: str,
 
 
     # Add this to check if documents exist in the collection
-    collection = client.get_collection("rag_documents")
+    collection = client.get_collection("msi_documents")
     count = collection.count()
     logger.info(f"Documents in vector database: {count}")
 
@@ -2283,11 +2282,11 @@ def process_query(query: str,
 # ------------------------------
 
 @flow(
-    name="rag_pipeline",
+    name="msi_pipeline",
     description="Full RAG pipeline from scraping to indexing",
     log_prints=True
 )
-def rag_pipeline(base_url: str, config: Dict = None):
+def msi_pipeline(base_url: str, config: Dict = None):
     """
     Run the full RAG pipeline from scraping to indexing.
     
@@ -2358,11 +2357,11 @@ def rag_pipeline(base_url: str, config: Dict = None):
     }
 
 @flow(
-    name="update_rag_pipeline",
+    name="update_msi_pipeline",
     description="Update RAG pipeline with new or changed documents",
     log_prints=True
 )
-def update_rag_pipeline(base_url: str, config: Dict = None):
+def update_msi_pipeline(base_url: str, config: Dict = None):
     """
     Update the RAG pipeline with new or changed documents.
     
@@ -2437,11 +2436,11 @@ def update_rag_pipeline(base_url: str, config: Dict = None):
     }
 
 @flow(
-    name="query_rag_system",
+    name="query_msi_system",
     description="Query the RAG system and get an answer",
     log_prints=True
 )
-def query_rag_system(query: str, db_dir: str = "vector_db", k: int = 5):
+def query_msi_system(query: str, db_dir: str = "vector_db", k: int = 5):
     """
     Query the RAG system and get an answer.
     
@@ -2877,11 +2876,11 @@ if __name__ == "__main__":
     
     # Run the pipeline
     try:
-        result = rag_pipeline("https://evolutionmining.com.au", config)
+        result = msi_pipeline("https://evolutionmining.com.au", config)
         
         # Query
-        answer = query_rag_system(
-            "What did the mineral resources and ore reserves portfolio look like?",
+        answer = query_msi_system(
+            "What was total gold production in tons for the year?",
             db_dir=result['db_dir']
         )
         
