@@ -2437,10 +2437,10 @@ if __name__ == "__main__":
     
     # Configuration
     config = {
-        'download_dir': 'downloaded_pdfs',
-        'processed_dir': 'processed_pdfs',
-        'chunked_dir': 'chunked_docs',
-        'vector_db_dir': 'vector_db',
+        'download_dir': '1_downloaded_pdfs',
+        'processed_dir': '2_processed_pdfs',
+        'chunked_dir': '3_chunked_docs',
+        'vector_db_dir': '4_vector_db',
         'max_pdfs': 20,
         'max_pages': 5,
         'reprocess': False

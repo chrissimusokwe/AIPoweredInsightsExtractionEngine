@@ -126,7 +126,8 @@ class LlamaConfig:
                 cls._tokenizer = LlamaTokenizer.from_pretrained(
                     cls.LLAMA_MODEL_PATH,
                     local_files_only=True,  # This tells the library to only look for files locally
-                    trust_remote_code=True  # This allows the model to run any custom code that might be included in the model files
+                    trust_remote_code=True,  # This allows the model to run any custom code that might be included in the model files
+                    repo_type="local"  # This specifies that the model is stored locally
                 )
                 
                 # Load the model
@@ -135,7 +136,8 @@ class LlamaConfig:
                     torch_dtype=torch.float16,  # Use half precision for memory efficiency
                     device_map="auto",  # Automatically choose the best device
                     local_files_only=True,  # This tells the library to only look for files locally
-                    trust_remote_code=True  # This allows the model to run any custom code that might be included in the model files
+                    trust_remote_code=True,  # This allows the model to run any custom code that might be included in the model files
+                    repo_type="local"  # This specifies that the model is stored locally
                 )
             except Exception as e:
                 logging.error(f"Error loading Meta Llama model: {str(e)}")
@@ -1601,21 +1603,31 @@ def embed_and_index_documents(documents: List[Document],
                     
                     # Process each metadata field according to its type
                     for key, value in doc.metadata.items():
-                        # SIMPLE TYPES: Store directly in ChromaDB for filtering and faceting
-                        # Includes primitive types and simple arrays of primitives
-                        if isinstance(value, (str, int, float, bool)) or (
-                            isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value)
-                        ):
+                        # For lists, convert to string representation
+                        if isinstance(value, list):
+                            # Convert list to string representation for ChromaDB
+                            simple_metadata[key] = json.dumps(value)  # Convert list to JSON string
+                            enhanced_metadata[key] = value  # Keep original in enhanced metadata
+                        # SIMPLE TYPES: Store directly in ChromaDB for filtering
+                        elif isinstance(value, (str, int, float, bool)):
                             simple_metadata[key] = value
-                        # COMPLEX TYPES: Store in separate metadata store for richer querying
-                        # Includes nested objects, complex arrays, and special fields
-                        elif isinstance(value, (list, dict)) or key in ['labels', 'keywords']:
-                            enhanced_metadata[key] = value
+                        # COMPLEX TYPES: Store in separate metadata store
+                        elif isinstance(value, dict):
+                            simple_metadata[key] = json.dumps(value)  # Convert dict to JSON string
+                            enhanced_metadata[key] = value  # Keep original in enhanced metadata
+                        # For any other types, convert to string
+                        else:
+                            try:
+                                simple_metadata[key] = str(value)
+                                enhanced_metadata[key] = value
+                            except:
+                                # If conversion fails, skip this metadata
+                                logger.warning(f"Skipping metadata key {key} with unsupported type {type(value)}")
                     
                     # Add simple metadata to ChromaDB batch
                     metadatas.append(simple_metadata)
                     
-                    # Store complex metadata separately if present
+                    # Store enhanced metadata separately if present
                     if enhanced_metadata:
                         metadata_store[doc_id] = enhanced_metadata
                 
@@ -1676,6 +1688,7 @@ def embed_and_index_documents(documents: List[Document],
     # Log final indexing statistics
     logger.info(f"Successfully indexed {len(documents)} documents in the vector database")
 
+
 def search_cache_key_fn(context, parameters):
     """
     Generate a cache key for the semantic search function that excludes
@@ -1735,22 +1748,25 @@ def semantic_search(query: str,
     # This is where all the vector representations and simple metadata are stored
     logger.debug(f"Connecting to vector database collection 'rag_documents'")
     collection = client.get_collection("rag_documents")
+    
+    # Log the count of documents in collection
     doc_count = collection.count()
     logger.info(f"Collection contains {doc_count} documents")
+    
+    if doc_count == 0:
+        logger.warning("Vector database is empty. No documents to search.")
+        return []
     
     # QUERY EMBEDDING GENERATION:
     # Convert the textual query into the same vector space as our documents
     # This transformation enables semantic matching rather than keyword matching
     logger.debug(f"Generating embedding for query: '{query}'")
     query_embedding = get_embeddings([query])[0]
-    logger.info(f"Generated embedding of dimension {len(query_embedding)}")
     
     # ENHANCED METADATA RETRIEVAL:
     # Get path to the supplementary metadata store
     # This contains complex metadata that couldn't be stored directly in ChromaDB
     metadata_store_path = os.path.join(db_dir, "metadata_store.json")
-    embedding_norm = sum(x*x for x in query_embedding) ** 0.5
-    logger.info(f"Query embedding norm: {embedding_norm:.4f}")
     
     # Load the enhanced metadata store to access rich document information
     # This includes complex structures like nested objects and detailed labels
@@ -1778,28 +1794,30 @@ def semantic_search(query: str,
             # BASIC SIMILARITY SEARCH:
             # Perform standard vector similarity search with no filtering
             # This finds the k most semantically similar documents to the query
-            logger.info("Searching without filters")
             logger.info(f"Executing basic semantic search for query: '{query}'")
             results = collection.query(
                 query_embeddings=[query_embedding],  # Vector representation of query
                 n_results=k,                         # Number of results to retrieve
-                include=["documents", "metadatas", "distances"]  # Data to include in results
+                include=["documents", "metadatas", "distances", "ids"]  # Data to include in results
             )
             logger.debug(f"Retrieved {len(results['documents'][0])} results from vector database")
         else:
             # ENHANCED FILTERED SEARCH:
             # Two-stage search with post-filtering for more targeted results
             # First retrieves more candidates, then filters to the most relevant k
-            logger.info(f"Searching with filters: {filter_labels}")
             logger.info(f"Executing filtered semantic search with labels: {filter_labels}")
+            
+            # Convert filter_labels to JSON string format for comparison with stored values
+            filter_labels_json = json.dumps(filter_labels)
+            logger.debug(f"Filter labels JSON: {filter_labels_json}")
             
             # INITIAL OVER-RETRIEVAL:
             # Get more results than needed to allow for filtering
             # This compensates for results that might be filtered out
-            logger.debug(f"Retrieving {k*2} initial candidates for filtering")
+            logger.debug(f"Retrieving {k*3} initial candidates for filtering")
             results = collection.query(
                 query_embeddings=[query_embedding],
-                n_results=k*2,                      # Get twice as many results as needed
+                n_results=k*3,                      # Get more results initially
                 include=["documents", "metadatas", "distances", "ids"]  # Include IDs for metadata lookup
             )
             
@@ -1811,22 +1829,43 @@ def semantic_search(query: str,
             filter_stats = {label: 0 for label in filter_labels}
             
             for i, doc_id in enumerate(results['ids'][0]):
-                # Get enhanced metadata from store for rich filtering
-                enhanced_metadata = metadata_store.get(doc_id, {})
-                doc_labels = enhanced_metadata.get('labels', [])
+                # First check if 'labels' is in the simple metadata
+                doc_metadata = results['metadatas'][0][i]
                 
-                # Check if any of the required labels are present
-                # This implements an OR relationship between filter labels
-                matches = [label for label in filter_labels if label in doc_labels]
-                if matches:
-                    filtered_indices.append(i)
-                    for match in matches:
-                        filter_stats[match] += 1
+                # Check for labels in metadata (stored as JSON string)
+                labels_found = False
+                if 'labels' in doc_metadata:
+                    try:
+                        # Try to parse the JSON string
+                        doc_labels = json.loads(doc_metadata['labels'])
+                        # Check if any required label matches
+                        matches = [label for label in filter_labels if label in doc_labels]
+                        if matches:
+                            filtered_indices.append(i)
+                            for match in matches:
+                                filter_stats[match] += 1
+                            labels_found = True
+                    except json.JSONDecodeError:
+                        # If not valid JSON, treat as plain text
+                        if any(label in doc_metadata['labels'] for label in filter_labels):
+                            filtered_indices.append(i)
+                            labels_found = True
+                
+                # If not found in simple metadata, check enhanced metadata
+                if not labels_found and doc_id in metadata_store:
+                    enhanced_metadata = metadata_store[doc_id]
+                    if 'labels' in enhanced_metadata:
+                        doc_labels = enhanced_metadata['labels']
+                        matches = [label for label in filter_labels if label in doc_labels]
+                        if matches:
+                            filtered_indices.append(i)
+                            for match in matches:
+                                filter_stats[match] += 1
                     
                 # Stop once we have enough filtered results
                 if len(filtered_indices) >= k:
                     break
-            
+                    
             # FILTER APPLICATION:
             # Construct filtered result set based on label matching
             logger.debug(f"Filter matches: {filter_stats}")
@@ -1864,6 +1903,17 @@ def semantic_search(query: str,
             
             # Get base metadata from ChromaDB (simple types only)
             doc_metadata = results['metadatas'][0][i].copy() if results['metadatas'][0][i] else {}
+            
+            # METADATA PARSING:
+            # Convert stored JSON strings back to original Python objects
+            for key, value in list(doc_metadata.items()):
+                if isinstance(value, str) and (value.startswith('[') or value.startswith('{')):
+                    try:
+                        # Try to parse JSON strings back to Python objects
+                        doc_metadata[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        # If parsing fails, keep as string
+                        pass
             
             # METADATA ENRICHMENT:
             # Add enhanced metadata from separate store
@@ -2792,10 +2842,10 @@ if __name__ == "__main__":
     
     # Configuration for the RAG pipeline
     config = {
-        'download_dir': 'downloaded_pdfs',
-        'processed_dir': 'processed_pdfs',
-        'chunked_dir': 'chunked_docs',
-        'vector_db_dir': 'vector_db',
+        'download_dir': '1_downloaded_pdfs',
+        'processed_dir': '2_processed_pdfs',
+        'chunked_dir': '3_chunked_docs',
+        'vector_db_dir': '4_vector_db',
         'max_pdfs': 20,
         'max_pages': 5,
         'reprocess': False,
