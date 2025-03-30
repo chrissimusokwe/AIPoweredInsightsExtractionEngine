@@ -1,5 +1,9 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
 
+.env
+.DS_Store
+.gitignore
+
 /__pycache__/
 /.pytest_cache/
 /.mypy_cache/
@@ -7,8 +11,7 @@
 /.coverage.*
 /.hypothesis/ 
 /env/
-.env
-.DS_Store
+
 /models/
 /processed_pdfs/
 /vector_db/
