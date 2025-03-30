@@ -20,6 +20,7 @@ from tqdm import tqdm
 import concurrent.futures
 from pydantic import BaseModel, Field
 import openai
+from hashlib import sha256
 
 # Import Prefect for workflow orchestration
 from prefect import task, flow, get_run_logger
@@ -566,9 +567,10 @@ def process_pdf(filename: str, filepath: str, metadata: Dict, output_dir: str, t
 
 @task(
     name="process_pdfs",
-    description="Process all PDFs in batch",
-    retries=1,
-    retry_delay_seconds=60
+    description="Process all PDFs in batch to extract text, tables, and structured data",
+    retries=1,                  # Retry once if the task fails
+    retry_delay_seconds=60,     # Wait 60 seconds before retrying
+    # Cache configuration could be added here if needed
 )
 def process_pdfs(pdf_metadata: Dict[str, Dict], 
                 input_dir: str, 
@@ -576,70 +578,102 @@ def process_pdfs(pdf_metadata: Dict[str, Dict],
                 topic_definitions: Dict[str, str],
                 reprocess_all: bool = False) -> Dict[str, Dict]:
     """
-    Process all PDFs in the input directory.
+    Process all PDFs in the input directory by extracting text, tables, images, and structured data.
+    Implements an incremental processing strategy that only processes new or changed files
+    unless forced to reprocess everything.
     
     Args:
-        pdf_metadata: Metadata of PDFs to process
-        input_dir: Input directory containing PDFs
-        output_dir: Output directory for processed files
-        topic_definitions: Dictionary of topic definitions for classification
-        reprocess_all: Whether to reprocess all PDFs or just new ones
+        pdf_metadata: Dictionary mapping filenames to their metadata including file paths and hashes
+        input_dir: Directory containing the downloaded PDF files to process
+        output_dir: Directory where processed files and extracted data will be saved
+        topic_definitions: Dictionary of topic definitions used for content classification
+        reprocess_all: Flag to force reprocessing of all PDFs even if unchanged
         
     Returns:
-        Dictionary with processing results
+        Dictionary mapping filenames to their processing results including extracted content
     """
+    # Get a Prefect logger for proper task logging within the Prefect UI
     logger = get_run_logger()
     
-    # Create output directory if it doesn't exist
+    # Create output directory if it doesn't exist to avoid file write errors
     if not os.path.exists(output_dir):
+        logger.info(f"Creating output directory: {output_dir}")
         os.makedirs(output_dir)
     
+    # Path for the metadata file that tracks processing status across runs
     processed_path = os.path.join(output_dir, 'processed_metadata.json')
     
-    # Load existing processed metadata if available to avoid duplicate work
+    # INCREMENTAL PROCESSING STRATEGY:
+    # Load existing processed metadata if available to implement incremental processing
+    # This allows us to skip unchanged files and only process new or modified PDFs
     if os.path.exists(processed_path) and not reprocess_all:
+        logger.info(f"Loading existing processed metadata from {processed_path}")
         processed_metadata = pd.read_json(processed_path, orient='index').to_dict(orient='index')
+        logger.info(f"Found {len(processed_metadata)} previously processed PDFs")
     else:
+        logger.info("No existing metadata found or reprocessing all files")
         processed_metadata = {}
         
-    # Determine which files to process - only process new or changed PDFs unless forced
+    # BUILD PROCESSING QUEUE:
+    # Determine which files need processing based on their hash values
+    # Files are selected for processing if they are:
+    #  1. New (not in processed_metadata)
+    #  2. Changed (hash differs from previously processed version)
+    #  3. Force reprocessing is enabled (reprocess_all=True)
     to_process = []
+    skipped = 0
     for filename, metadata in pdf_metadata.items():
         filepath = metadata['path']
         
-        # Skip if already processed and unchanged (using hash comparison)
+        # Hash comparison to detect file changes
         if (filename in processed_metadata and 
             metadata['hash'] == processed_metadata[filename].get('hash') and
             not reprocess_all):
+            # Skip unchanged files to save processing time
+            skipped += 1
             continue
             
+        # Queue file for processing with its metadata
         to_process.append((filename, filepath, metadata))
         
-    logger.info(f"Processing {len(to_process)} PDFs")
+    logger.info(f"Processing {len(to_process)} PDFs (skipped {skipped} unchanged files)")
     
-    # Process PDFs in parallel using ThreadPoolExecutor for better performance
+    # PARALLEL PROCESSING IMPLEMENTATION:
+    # Process PDFs in parallel to maximize throughput
+    # Uses ThreadPoolExecutor which is ideal for I/O-bound tasks like PDF processing
     with tqdm(total=len(to_process), desc="Processing PDFs") as pbar:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # Create a mapping of futures to filenames for tracking results
             future_to_file = {
+                # Submit each PDF for processing as a separate task
                 executor.submit(process_pdf, filename, filepath, metadata, output_dir, topic_definitions): 
                 filename for filename, filepath, metadata in to_process
             }
             
+            # Collect results as they complete (in any order)
             for future in concurrent.futures.as_completed(future_to_file):
                 filename = future_to_file[future]
                 try:
+                    # Get the processing result for this PDF
                     result = future.result()
+                    # Store the result in our metadata dictionary
                     processed_metadata[filename] = result
+                    logger.debug(f"Successfully processed {filename}")
                 except Exception as e:
+                    # Log detailed error but continue processing other PDFs
                     logger.error(f"Error processing {filename}: {str(e)}")
+                # Update progress bar after each PDF completes
                 pbar.update(1)
                 
-    # Save processed metadata for future runs
+    # PERSISTENCE FOR INCREMENTAL PROCESSING:
+    # Save processed metadata to enable incremental processing in future runs
+    # This creates a persistent record of which files have been processed and their hash values
+    logger.info(f"Saving processed metadata to {processed_path}")
     pd.DataFrame.from_dict(processed_metadata, orient='index').to_json(
         processed_path, orient='index', indent=2
     )
     
-    logger.info(f"Processed {len(to_process)} PDFs")
+    logger.info(f"Successfully processed {len(to_process)} PDFs")
     return processed_metadata
 
 # ------------------------------
@@ -647,72 +681,94 @@ def process_pdfs(pdf_metadata: Dict[str, Dict],
 # ------------------------------
 
 @task(
-    name="chunk_document",
+    name="chunk_document",                      # Task name in Prefect UI
     description="Chunk a document into semantic units for better retrieval",
-    retries=2,
-    retry_delay_seconds=15
+    retries=2,                                  # Will retry twice if the task fails
+    retry_delay_seconds=15                      # Wait 15 seconds between retries
+    # No caching configuration as each document should be freshly processed
 )
 def chunk_document(filename: str, metadata: Dict, 
                   output_dir: str, 
                   topic_definitions: Dict[str, str]) -> List[Document]:
     """
-    Chunk a single document and label each chunk with relevant topics.
-    Preserves document structure when possible by using sections.
+    Chunk a single document into semantic units, label each chunk with relevant topics,
+    and enrich chunks with metadata for improved retrieval. This function implements
+    a two-stage chunking strategy that prioritizes preserving document structure.
     
     Args:
-        filename: Name of the document
-        metadata: Metadata of the document
-        output_dir: Directory to save chunked results
-        topic_definitions: Dictionary of topic definitions for labeling
+        filename: Name of the document file (used for identification and output paths)
+        metadata: Complete metadata of the document including text content and structure
+        output_dir: Directory where chunked results and labels will be saved
+        topic_definitions: Dictionary mapping topic names to their descriptions for labeling
         
     Returns:
-        List of chunked and labeled documents
+        List of chunked and labeled Document objects ready for vector storage
     """
+    # Get Prefect logger for task-specific logging within Prefect UI
     logger = get_run_logger()
     
-    # Initialize topic classifier for chunk labeling
+    # TOPIC CLASSIFICATION SETUP:
+    # Initialize the topic classifier for semantic labeling of chunks
+    # This creates vectorized representations of topic definitions for later comparison
+    logger.debug(f"Initializing topic classifier with {len(topic_definitions)} topics")
     vectorizer, vectors, topic_names = initialize_topic_classifier(topic_definitions)
     
-    text = metadata['text']
-    title = metadata['original_metadata']['title']
-    source_url = metadata['original_metadata']['url']
+    # Extract essential document information from metadata
+    text = metadata['text']                             # Full document text
+    title = metadata['original_metadata']['title']      # Document title
+    source_url = metadata['original_metadata']['url']   # Source URL
     
     # Get structured data if available for enriching chunk metadata
+    # This allows us to associate extracted structured information with each chunk
     structured_data = metadata.get('structured_data', {})
     
-    # Initialize the text splitter for chunking 
-    chunk_size = 1000
-    chunk_overlap = 200
+    # CHUNKING CONFIGURATION:
+    # Set parameters for text splitting to balance context and specificity
+    chunk_size = 1000      # Target size of each chunk (characters)
+    chunk_overlap = 200    # Overlap between chunks to maintain context across boundaries
     
-    # First try semantic chunking using sections to preserve document structure
+    # DOCUMENT STRUCTURE-AWARE CHUNKING:
+    # First try semantic chunking using predefined document sections
+    # This preserves the logical structure of the document when possible
     chunks = []
+    logger.debug(f"Attempting section-based chunking for {filename}")
+    
     if 'sections' in metadata and metadata['sections']:
+        section_count = 0
         for i, section in enumerate(metadata['sections']):
             section_text = section['text']
             section_title = section['title']
             
-            # Skip very short sections (likely headers without content)
+            # Skip very short sections which are likely just headings
             if len(section_text) < 100:
+                logger.debug(f"Skipping short section: {section_title} ({len(section_text)} chars)")
                 continue
                 
-            # Split section text into chunks of appropriate size with overlap
+            # Process each section into appropriately sized chunks with proper overlap
+            # Each chunk retains knowledge of its source section for context
             section_chunks = split_text(
                 text=section_text,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 metadata={
-                    'source': filename,
-                    'title': title,
-                    'section': section_title,
-                    'section_idx': i,
-                    'url': source_url,
-                    'chunk_type': 'section'
+                    'source': filename,           # Original document filename
+                    'title': title,               # Document title
+                    'section': section_title,     # Section title
+                    'section_idx': i,             # Section position in document
+                    'url': source_url,            # Source URL
+                    'chunk_type': 'section'       # Indicates this is a section-based chunk
                 }
             )
             chunks.extend(section_chunks)
+            section_count += 1
+            
+        logger.debug(f"Created {len(chunks)} chunks from {section_count} sections")
     
-    # If no sections or very few chunks, fall back to whole document chunking
+    # FALLBACK TO WHOLE DOCUMENT CHUNKING:
+    # If document has no sections or too few chunks were created,
+    # fall back to chunking the entire document as a whole
     if len(chunks) < 3:
+        logger.info(f"Insufficient section-based chunks ({len(chunks)}), falling back to whole document chunking")
         chunks = split_text(
             text=text,
             chunk_size=chunk_size,
@@ -721,49 +777,67 @@ def chunk_document(filename: str, metadata: Dict,
                 'source': filename,
                 'title': title,
                 'url': source_url,
-                'chunk_type': 'document'
+                'chunk_type': 'document'        # Indicates this is a whole-document chunk
             }
         )
+        logger.debug(f"Created {len(chunks)} chunks from whole document")
         
-    # Add chunk index, labels, and enhanced metadata
+    # CHUNK ENHANCEMENT AND LABELING:
+    # Enhance each chunk with additional metadata, classifications, and keywords
+    # to improve search relevance and enable advanced filtering
+    logger.debug(f"Enhancing and labeling {len(chunks)} chunks")
     labeled_chunks = []
+    
     for i, chunk in enumerate(chunks):
-        # Label the chunk with relevant topics
+        # TOPIC LABELING:
+        # Label each chunk with relevant topics based on semantic similarity
+        # This enables topic-based filtering during retrieval
         labels = label_chunk(chunk.page_content, vectorizer, vectors, topic_names)
         
-        # Create LabeledChunk model for persistent storage
+        # Create a structured record of chunk labels for external use
         labeled_chunk = LabeledChunk(
             chunk_index=i,
             labels=labels
         )
         
-        # Add metadata to chunk for improved retrieval
-        chunk.metadata['chunk_idx'] = i
-        chunk.metadata['total_chunks'] = len(chunks)
-        chunk.metadata['labels'] = labels
+        # METADATA ENRICHMENT:
+        # Add indexing and relationship metadata
+        chunk.metadata['chunk_idx'] = i                  # Position in chunk sequence
+        chunk.metadata['total_chunks'] = len(chunks)     # Total chunks from this document
+        chunk.metadata['labels'] = labels                # Topic labels for filtering
         
         # Add structured data references if available
+        # This connects chunks to document-level structured information
         if structured_data:
+            # Add core document metadata
             chunk.metadata['document_name'] = structured_data.get('document_name', '')
             chunk.metadata['document_date'] = structured_data.get('document_date', '')
             chunk.metadata['document_author'] = structured_data.get('document_author', '')
             
-            # Add topic data if this chunk matches any of the classified topics
-            # This helps identify the "primary topic" of each chunk
+            # TOPIC ASSOCIATION:
+            # Determine if this chunk is the primary source for any classified topics
+            # This identifies "authoritative chunks" for each topic
             if 'topics' in metadata:
                 for topic, topic_text in metadata['topics'].items():
+                    # If the chunk contains the exact text snippet that defined a topic,
+                    # mark this chunk as a primary source for that topic
                     if topic_text in chunk.page_content:
                         chunk.metadata['primary_topic'] = topic
+                        logger.debug(f"Chunk {i} identified as primary for topic: {topic}")
                         break
         
-        # Extract likely keywords from the chunk for additional retrieval signals
+        # KEYWORD EXTRACTION:
+        # Extract representative keywords from the chunk
+        # This enables keyword-based search and additional retrieval signals
         keywords = extract_keywords(chunk.page_content)
         chunk.metadata['keywords'] = keywords
         
-        # Store the labeled chunk
+        # Add to collection of processed chunks
         labeled_chunks.append(chunk)
         
-        # Save labeled chunk data as JSON for external use
+        # PERSISTENCE:
+        # Save labeled chunk data as JSON for external use and debugging
+        # This makes the chunk metadata accessible outside the vector database
         labeled_chunk_path = os.path.join(
             output_dir, 
             f"{os.path.splitext(filename)[0]}_chunk_{i}_labels.json"
@@ -771,83 +845,134 @@ def chunk_document(filename: str, metadata: Dict,
         with open(labeled_chunk_path, 'w', encoding='utf-8') as f:
             json.dump(labeled_chunk.dict(), f, indent=2)
         
+    logger.info(f"Successfully processed {len(labeled_chunks)} chunks from {filename}")
     return labeled_chunks
 
 @task(
-    name="chunk_documents",
-    description="Chunk all documents in batch",
-    retries=1,
-    retry_delay_seconds=30
+    name="chunk_documents",                   # Prefect task name for UI display
+    description="Chunk all documents in batch with incremental processing",
+    retries=1,                                # Will retry once if the task fails
+    retry_delay_seconds=30,                   # Wait 30 seconds before retry
+    # Could add cache_key_fn and cache_expiration here if needed
 )
 def chunk_documents(processed_metadata: Dict[str, Dict], 
                    chunked_dir: str,
                    topic_definitions: Dict[str, str],
                    rechunk_all: bool = False) -> List[Document]:
     """
-    Chunk all processed documents and label the chunks.
-    Handles incremental processing to avoid rechunking unchanged documents.
+    Orchestrates the chunking process for all processed documents, implementing
+    an incremental processing strategy that only processes new or changed documents.
+    This function serves as the batch coordinator for the individual chunk_document tasks.
     
     Args:
-        processed_metadata: Metadata of processed documents
-        chunked_dir: Directory to save chunked documents
-        topic_definitions: Dictionary of topic definitions for labeling
-        rechunk_all: Whether to rechunk all documents or just new ones
+        processed_metadata: Dictionary of document metadata from the processing stage
+        chunked_dir: Output directory where chunked documents and metadata will be stored
+        topic_definitions: Dictionary mapping topic names to descriptions for semantic labeling
+        rechunk_all: Flag to force rechunking of all documents regardless of change status
         
     Returns:
-        List of chunked and labeled documents
+        List of all document chunks created, ready for vector database indexing
     """
+    # Get Prefect logger for task-specific logging
     logger = get_run_logger()
     
-    # Create output directory if it doesn't exist
+    # DIRECTORY SETUP:
+    # Ensure output directory exists to prevent file write errors
     if not os.path.exists(chunked_dir):
+        logger.info(f"Creating chunking output directory: {chunked_dir}")
         os.makedirs(chunked_dir)
     
+    # PERSISTENCE CONFIGURATION:
+    # Define path for metadata file that tracks chunking status across pipeline runs
     chunked_path = os.path.join(chunked_dir, 'chunked_metadata.json')
     
-    # Load existing chunked metadata if available
+    # INCREMENTAL PROCESSING SETUP:
+    # Load existing metadata if available to enable incremental processing
+    # This allows us to skip rechunking documents that haven't changed
     if os.path.exists(chunked_path) and not rechunk_all:
+        logger.info(f"Loading existing chunking metadata from {chunked_path}")
         chunked_metadata = pd.read_json(chunked_path, orient='index').to_dict(orient='index')
+        logger.info(f"Found {len(chunked_metadata)} previously chunked documents")
     else:
+        if rechunk_all:
+            logger.info("Rechunking all documents (forced by rechunk_all flag)")
+        else:
+            logger.info("No existing chunking metadata found - processing all documents")
         chunked_metadata = {}
         
-    # Determine which files to chunk - only process new or changed documents
+    # DOCUMENT SELECTION:
+    # Identify documents that need chunking based on hash comparison
+    # Documents are selected for chunking if they are:
+    #  1. New (not in chunked_metadata)
+    #  2. Modified (hash differs from previous chunking)
+    #  3. Force rechunking is enabled (rechunk_all=True)
     to_chunk = []
+    skipped_count = 0
+    
     for filename, metadata in processed_metadata.items():
-        # Skip if already chunked and unchanged (using hash comparison)
+        # Check if document has been chunked before and is unchanged
         if (filename in chunked_metadata and 
             metadata['hash'] == chunked_metadata[filename].get('hash') and
             not rechunk_all):
+            # Skip unchanged documents to save processing time
+            skipped_count += 1
             continue
             
+        # Queue document for chunking
         to_chunk.append((filename, metadata))
         
-    logger.info(f"Chunking {len(to_chunk)} documents")
+    logger.info(f"Chunking {len(to_chunk)} documents (skipped {skipped_count} unchanged documents)")
     
-    all_chunks = []
+    # BATCH PROCESSING:
+    # Process each document sequentially with progress tracking
+    # Could be parallelized with concurrent.futures like in process_pdfs
+    # but chunking is often more CPU-intensive than I/O-bound
+    all_chunks = []  # Collects all chunks from all documents
     
     with tqdm(total=len(to_chunk), desc="Chunking documents") as pbar:
         for filename, metadata in to_chunk:
             try:
+                # INDIVIDUAL DOCUMENT CHUNKING:
+                # Process each document by calling the chunk_document task
+                # This delegates the actual chunking work to a separate Prefect task
+                logger.debug(f"Chunking document: {filename}")
                 chunks = chunk_document(filename, metadata, chunked_dir, topic_definitions)
+                
+                # Accumulate all chunks for vector database indexing
                 all_chunks.extend(chunks)
                 
-                # Update chunked metadata to avoid reprocessing unchanged documents
+                # METADATA TRACKING:
+                # Update chunking metadata to record successful processing
+                # This enables incremental processing in future pipeline runs
                 chunked_metadata[filename] = {
-                    'hash': metadata['hash'],
-                    'chunking_date': datetime.now().isoformat(),
-                    'num_chunks': len(chunks)
+                    'hash': metadata['hash'],                    # Document hash for change detection
+                    'chunking_date': datetime.now().isoformat(), # Timestamp for auditing/debugging
+                    'num_chunks': len(chunks)                    # Number of chunks created
                 }
+                
+                logger.debug(f"Created {len(chunks)} chunks from {filename}")
             except Exception as e:
+                # ERROR HANDLING:
+                # Log detailed error but continue processing other documents
+                # This ensures partial progress even if some documents fail
                 logger.error(f"Error chunking {filename}: {str(e)}")
                 
+            # Update progress bar after each document completes
             pbar.update(1)
             
-    # Save chunked metadata for future runs
+    # PERSISTENCE FOR INCREMENTAL PROCESSING:
+    # Save chunking metadata to enable incremental processing in future runs
+    # This creates a persistent record of which documents have been chunked and their hash values
+    logger.info(f"Saving chunking metadata to {chunked_path}")
     pd.DataFrame.from_dict(chunked_metadata, orient='index').to_json(
         chunked_path, orient='index', indent=2
     )
     
-    logger.info(f"Created {len(all_chunks)} chunks from {len(to_chunk)} documents")
+    # RESULTS SUMMARY:
+    # Log overall statistics about the chunking process
+    avg_chunks = len(all_chunks) / len(to_chunk) if to_chunk else 0
+    logger.info(f"Created {len(all_chunks)} total chunks from {len(to_chunk)} documents (avg: {avg_chunks:.1f} chunks/doc)")
+    
     return all_chunks
 
 # ------------------------------
@@ -891,187 +1016,573 @@ def initialize_vector_db(db_dir: str) -> chromadb.PersistentClient:
         logger.error(f"Error initializing vector database: {str(e)}")
         raise
 
+def embedding_cache_key_fn(context, parameters):
+    """
+    Generate a cache key for the embedding task based on:
+    1. Document content hashes
+    2. Database configuration
+    3. Embedding model version
+    
+    Returns:
+        str: A unique hash representing the task inputs
+    """
+    # Extract parameters
+    documents = parameters["documents"]
+    batch_size = parameters["batch_size"]
+    
+    # Generate a hash of document contents
+    doc_hashes = []
+    for doc in documents:
+        # Hash the document content and key metadata
+        doc_hash = sha256()
+        doc_hash.update(doc.page_content.encode())
+        
+        # Add critical metadata to the hash
+        if doc.metadata:
+            # Only include metadata that affects embedding/retrieval
+            critical_metadata = {
+                k: v for k, v in doc.metadata.items() 
+                if k in ['chunk_idx', 'source', 'labels']
+            }
+            doc_hash.update(json.dumps(critical_metadata, sort_keys=True).encode())
+            
+        doc_hashes.append(doc_hash.hexdigest())
+    
+    # Sort to ensure consistent order
+    doc_hashes.sort()
+    
+    # Combine document hashes with other parameters
+    combined_hash = sha256()
+    combined_hash.update("_".join(doc_hashes).encode())
+    combined_hash.update(str(batch_size).encode())
+    
+    # Add embedding model version to detect model changes
+    embedding_model_version = "text-embedding-ada-002"  # Update this if you change models
+    combined_hash.update(embedding_model_version.encode())
+    
+    return combined_hash.hexdigest()
+
 @task(
-    name="embed_and_index_documents",
+    name="get_embeddings",                        # Descriptive name in Prefect UI
+    description="Generate embeddings for text using OpenAI API",
+    retries=3,                                    # Retry 3 times on failure - helpful for API timeouts
+    retry_delay_seconds=5                         # Short delay between retries for transient errors
+)
+def get_embeddings(texts: List[str], model: str = "text-embedding-ada-002") -> List[List[float]]:
+    """
+    Generate vector embeddings for a list of texts using OpenAI's embedding API.
+    These embeddings are dense vector representations that capture semantic meaning,
+    enabling similarity search and semantic matching in the vector database.
+    
+    Args:
+        texts: List of text strings to convert to embeddings
+        model: OpenAI embedding model identifier (text-embedding-ada-002 produces 1536-dimensional vectors)
+        
+    Returns:
+        List of embedding vectors, each being a list of 1536 floating-point values
+    """
+    # LOGGING SETUP:
+    # Get Prefect logger for structured task logging in the Prefect UI
+    logger = get_run_logger()
+    
+    # INPUT VALIDATION:
+    # Check for empty input to avoid unnecessary API calls and potential errors
+    if not texts:
+        logger.warning("Received empty text list for embedding generation - returning empty list")
+        return []
+        
+    try:
+        # EMBEDDING GENERATION:
+        # Call OpenAI's Embedding API to convert text into vector representations
+        # This is the core operation that enables semantic search in our RAG pipeline
+        logger.debug(f"Generating embeddings for {len(texts)} texts using model {model}")
+        
+        # API CALL:
+        # This sends text to OpenAI and receives vectors representing semantic meaning
+        # text-embedding-ada-002 produces 1536-dimensional vectors with strong performance
+        response = openai.Embedding.create(
+            input=texts,                # List of text strings to embed
+            model=model                 # Model identifier - determines vector dimensions and quality
+        )
+        
+        # RESPONSE PROCESSING:
+        # Extract the actual embedding vectors from the API response
+        # OpenAI returns a complex response object with metadata and embeddings
+        embeddings = [data.embedding for data in response.data]
+        
+        # Verify we got the expected number of embeddings back
+        if len(embeddings) != len(texts):
+            logger.warning(f"Expected {len(texts)} embeddings but received {len(embeddings)}")
+            
+        logger.debug(f"Successfully generated {len(embeddings)} embeddings of dimension {len(embeddings[0]) if embeddings else 0}")
+        
+        # QUALITY CHECK:
+        # Verify embeddings are non-zero (a zero vector would indicate possible failure)
+        if embeddings and all(sum(abs(x) for x in emb) < 0.01 for emb in embeddings):
+            logger.warning("Generated embeddings have very low magnitude - possible quality issue")
+        
+        return embeddings
+        
+    except openai.error.RateLimitError as e:
+        # RATE LIMITING HANDLER:
+        # OpenAI has rate limits that can be hit during batch processing
+        # This error is specifically handled for clear logging
+        logger.error(f"OpenAI rate limit exceeded: {str(e)}")
+        logger.info("Consider reducing batch size or increasing pause between batches")
+        # Re-raise to trigger Prefect retry mechanism
+        raise
+        
+    except openai.error.AuthenticationError as e:
+        # AUTHENTICATION ERROR:
+        # API key issues should fail fast as retries won't help
+        logger.error(f"OpenAI authentication error: {str(e)}")
+        logger.critical("Check your OpenAI API key configuration")
+        raise  # No sense retrying authentication errors
+        
+    except openai.error.APIError as e:
+        # OPENAI SERVICE ERROR:
+        # Problems on OpenAI's side - likely transient and worth retrying
+        logger.error(f"OpenAI API error: {str(e)}")
+        logger.info("This may be a transient issue, retrying...")
+        raise  # Trigger Prefect retry
+        
+    except Exception as e:
+        # GENERAL ERROR HANDLER:
+        # Catch any other unexpected errors for robustness
+        logger.error(f"Unexpected error generating embeddings: {type(e).__name__}: {str(e)}")
+        
+        # FALLBACK STRATEGY:
+        # Return zero embeddings as a last resort to prevent pipeline failure
+        # In production systems, this maintains pipeline integrity at cost of search quality
+        # Zero vectors won't match anything in semantic search
+        logger.warning(f"Returning zero embeddings due to API error - search quality will be affected")
+        
+        # Generate zero vectors with correct dimensionality (1536 for text-embedding-ada-002)
+        # Using zeros maintains the expected data structure for downstream processing
+        return [[0.0] * 1536 for _ in texts]  # 1536 dimensions for OpenAI ada embeddings
+
+@task(
+    name="get_embeddings_batch",                     # Task name for Prefect UI monitoring
+    description="Generate embeddings for texts in batches with rate limiting",
+    retries=2,                                       # Retry twice on failure - balances resilience with progress
+    retry_delay_seconds=10,                          # Longer delay between retries to allow API quotas to recover
+    # No caching by default as embeddings should be fresh; add cache_key_fn for dev/test environments if needed
+)
+def get_embeddings_batch(texts: List[str], 
+                         batch_size: int = 20,       # Conservative default to avoid API limits 
+                         model: str = "text-embedding-ada-002") -> List[List[float]]:
+    """
+    Process a large collection of texts into embeddings by breaking them into smaller batches
+    to manage API rate limits, memory usage, and error resilience. This is essential for
+    processing document collections of significant size in a production environment.
+    
+    Args:
+        texts: Complete list of text chunks to convert to embeddings
+        batch_size: Number of texts to process in each API call (OpenAI recommends ≤20)
+        model: OpenAI embedding model identifier (affects vector dimensions and quality)
+        
+    Returns:
+        List of embedding vectors for all input texts, preserving original order
+    """
+    # LOGGING INITIALIZATION:
+    # Get Prefect logger for structured task tracking in Prefect UI
+    logger = get_run_logger()
+    logger.info(f"Generating embeddings for {len(texts)} texts in batches of {batch_size}")
+    
+    # BATCH PROCESSING SETUP:
+    # Initialize container for all embeddings, preserving input text order
+    # Order preservation is critical for mapping embeddings back to documents
+    all_embeddings = []
+    
+    # Pre-calculate batch statistics for logging and progress tracking
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    estimated_tokens = sum(len(text.split()) * 1.3 for text in texts)  # Rough token estimate
+    logger.info(f"Processing approximately {estimated_tokens:.0f} tokens across {total_batches} batches")
+    
+    # RATE LIMITING PLANNING:
+    # Calculate API load to plan rate limiting (OpenAI limits are per minute)
+    # A conservative approach helps avoid throttling errors during large processing jobs
+    if total_batches > 5:
+        logger.info(f"Large job detected ({total_batches} batches) - implementing conservative rate limiting")
+        batch_pause = 2  # Seconds between batches for large jobs
+    else:
+        batch_pause = 1  # Standard pause for smaller jobs
+    
+    # BATCH PROCESSING LOOP:
+    # Process in batches with visual progress tracking via tqdm
+    # This provides real-time feedback during long-running embedding operations
+    with tqdm(total=len(texts), desc="Generating embeddings") as pbar:
+        for i in range(0, len(texts), batch_size):
+            # Extract the current batch while maintaining original indices
+            batch = texts[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            
+            # BATCH CONTEXT LOGGING:
+            # Log detailed batch information for monitoring and debugging
+            # This helps track progress and diagnose issues in specific batches
+            logger.debug(f"Processing embedding batch {batch_num}/{total_batches} " +
+                       f"(items {i} to {min(i+batch_size-1, len(texts)-1)})")
+            
+            # BATCH LENGTH ANALYSIS:
+            # Log batch text length statistics to help diagnose potential issues
+            # Extremely long texts might cause API issues or token limit problems
+            if logger.isEnabledFor(logging.DEBUG):
+                lengths = [len(text) for text in batch]
+                logger.debug(f"Batch text lengths - min: {min(lengths)}, " +
+                           f"max: {max(lengths)}, avg: {sum(lengths)/len(lengths):.1f} chars")
+            
+            try:
+                # EMBEDDING GENERATION:
+                # Call the individual embedding function for this batch
+                # This delegates to the more focused get_embeddings function
+                batch_embeddings = get_embeddings(batch, model)
+                
+                # VALIDATION:
+                # Verify batch results match expectations before proceeding
+                if len(batch_embeddings) != len(batch):
+                    logger.warning(f"Batch size mismatch: expected {len(batch)} embeddings, " +
+                                 f"got {len(batch_embeddings)} - data inconsistency may occur")
+                
+                # Accumulate results in order
+                all_embeddings.extend(batch_embeddings)
+                
+                # ADAPTIVE RATE LIMITING:
+                # Implement pause between batches to respect API rate limits
+                # This reduces the chance of rate limit errors during large jobs
+                if i + batch_size < len(texts):
+                    # Only pause if we have more batches to process
+                    logger.debug(f"Pausing {batch_pause}s to respect API rate limits")
+                    time.sleep(batch_pause)
+                    
+            except Exception as e:
+                # ERROR HANDLING:
+                # Handle batch failures while allowing the pipeline to continue
+                # This prevents a single batch error from failing the entire job
+                logger.error(f"Error in embedding batch {batch_num}/{total_batches}: {type(e).__name__}: {str(e)}")
+                
+                # DETAILED ERROR ANALYSIS:
+                # Log additional context to help diagnose the specific failure
+                if hasattr(e, 'headers'):
+                    logger.debug(f"API response headers: {e.headers}")
+                if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                    logger.debug(f"API status code: {e.response.status_code}")
+                
+                # DATA CONSISTENCY STRATEGY:
+                # Return zero embeddings for this batch to maintain index alignment
+                # This ensures downstream processing can continue with degraded data
+                # rather than failing entirely or corrupting the data structure
+                logger.warning(f"Using zero vectors for batch {batch_num} due to error - " +
+                             "search quality for these items will be affected")
+                zero_embeddings = [[0.0] * 1536 for _ in batch]  # 1536D for text-embedding-ada-002
+                all_embeddings.extend(zero_embeddings)
+                
+                # ADAPTIVE RATE LIMITING:
+                # Increase pause after errors to allow API quotas to recover
+                batch_pause = min(batch_pause * 2, 8)  # Exponential backoff up to 8 seconds
+                logger.debug(f"Increasing batch pause to {batch_pause}s after error")
+                
+            # Update progress bar after each batch completes
+            pbar.update(len(batch))
+    
+    # VALIDATION AND SUMMARY:
+    # Verify overall job results match expectations
+    if len(all_embeddings) != len(texts):
+        logger.error(f"Total embedding count mismatch: expected {len(texts)}, got {len(all_embeddings)}")
+    
+    # Calculate zero vectors to assess potential quality issues
+    zero_count = sum(1 for emb in all_embeddings if sum(abs(x) for x in emb) < 0.01)
+    if zero_count > 0:
+        logger.warning(f"{zero_count} zero/near-zero embeddings detected out of {len(all_embeddings)} " +
+                     f"({zero_count/len(all_embeddings)*100:.1f}%) - search quality will be affected")
+    
+    logger.info(f"Successfully completed embedding generation for {len(texts)} texts")
+    return all_embeddings
+
+@task(
+    name="embed_and_index_documents",                  # Task name displayed in Prefect UI
     description="Create embeddings and index documents in vector database",
-    retries=2,
-    retry_delay_seconds=30
+    cache_key_fn=embedding_cache_key_fn,               # Custom cache key function for caching
+    cache_expiration=timedelta(hours=24),              # Cache results for 24 hours
+    retries=2,                                         # Retry twice in case of API failures or network issues
+    retry_delay_seconds=30                             # 30-second pause between retries to avoid overwhelming APIs
 )
 def embed_and_index_documents(documents: List[Document], 
                              client: chromadb.PersistentClient, 
                              db_dir: str,
                              batch_size: int = 32) -> None:
     """
-    Create embeddings and index documents in the vector database.
+    Generate embeddings for chunked documents and store them in the vector database
+    along with their metadata. This function handles the semantic conversion of text
+    into vector representations while managing API rate limits and metadata complexity.
     
     Args:
-        documents: List of documents to index
-        client: ChromaDB client
-        db_dir: Directory where vector database is stored
-        batch_size: Batch size for indexing to manage API limits
+        documents: List of chunked Document objects ready for embedding and indexing
+        client: Initialized ChromaDB client connected to the vector database
+        db_dir: Directory where vector database and metadata are stored
+        batch_size: Number of documents to process in each batch (controls API usage)
     """
+    # Get Prefect logger for structured task logging
     logger = get_run_logger()
     logger.info(f"Indexing {len(documents)} documents in vector database")
     
-    # Get collection
+    # DATABASE INITIALIZATION:
+    # Get or create the collection for storing document embeddings
+    # This is the primary storage for the vector search capabilities
     collection = client.get_collection("rag_documents")
+    logger.debug(f"Connected to ChromaDB collection: rag_documents")
     
-    # Path for storing complex metadata separately
+    # METADATA STORAGE SETUP:
+    # ChromaDB has limitations on metadata complexity, so we use a separate
+    # JSON store for complex metadata structures (nested objects, arrays, etc.)
     metadata_store_path = os.path.join(db_dir, "metadata_store.json")
     
-    # Load existing metadata store if available
+    # Load existing metadata store if available to preserve previous metadata
+    # This allows incremental updates without losing previously stored metadata
     if os.path.exists(metadata_store_path):
         try:
+            logger.debug(f"Loading existing metadata store from {metadata_store_path}")
             with open(metadata_store_path, 'r', encoding='utf-8') as f:
                 metadata_store = json.load(f)
+            logger.debug(f"Loaded metadata for {len(metadata_store)} existing documents")
         except Exception as e:
             logger.error(f"Error loading metadata store: {str(e)}")
+            logger.warning("Creating new metadata store due to loading error")
             metadata_store = {}
     else:
+        logger.info("No existing metadata store found, creating new one")
         metadata_store = {}
     
-    # Process in batches to manage API rate limits and memory
+    # BATCH PROCESSING SETUP:
+    # Calculate number of batches for progress tracking and rate limiting
+    # This helps manage memory usage and API rate limits
     total_batches = (len(documents) + batch_size - 1) // batch_size
+    logger.info(f"Processing in {total_batches} batches of up to {batch_size} documents each")
     
+    # DOCUMENT INDEXING LOOP:
+    # Process documents in batches with progress tracking
     with tqdm(total=len(documents), desc="Indexing documents") as pbar:
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            logger.debug(f"Processing batch {batch_num}/{total_batches} ({len(batch)} documents)")
             
             try:
-                # Prepare batch data for ChromaDB
+                # DOCUMENT PREPARATION:
+                # Prepare document data for indexing in vector database
+                
+                # Generate unique IDs for each document in the batch
+                # These IDs must be stable across runs for proper incremental updates
                 ids = [f"doc_{i+j}" for j in range(len(batch))]
+                
+                # Extract text content from documents for embedding generation
                 texts = [doc.page_content for doc in batch]
                 
-                # Prepare metadata, filtering out complex structures
+                # METADATA HANDLING:
+                # Split metadata into "simple" types (stored directly in ChromaDB)
+                # and "complex" types (stored in separate JSON metadata store)
+                # This works around ChromaDB's limitations on metadata complexity
                 metadatas = []
+                
                 for j, doc in enumerate(batch):
                     doc_id = ids[j]
                     
-                    # Simplified metadata for ChromaDB
-                    simple_metadata = {}
-                    enhanced_metadata = {}
+                    # Separate metadata into simple and complex types
+                    simple_metadata = {}   # Goes directly into ChromaDB
+                    enhanced_metadata = {} # Goes into separate metadata store
                     
+                    # Process each metadata field according to its type
                     for key, value in doc.metadata.items():
-                        # Store simple types directly in ChromaDB
+                        # SIMPLE TYPES: Store directly in ChromaDB for filtering and faceting
+                        # Includes primitive types and simple arrays of primitives
                         if isinstance(value, (str, int, float, bool)) or (
                             isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value)
                         ):
                             simple_metadata[key] = value
-                        # Store complex types in separate metadata store
+                        # COMPLEX TYPES: Store in separate metadata store for richer querying
+                        # Includes nested objects, complex arrays, and special fields
                         elif isinstance(value, (list, dict)) or key in ['labels', 'keywords']:
                             enhanced_metadata[key] = value
                     
+                    # Add simple metadata to ChromaDB batch
                     metadatas.append(simple_metadata)
                     
-                    # Store complex metadata separately
+                    # Store complex metadata separately if present
                     if enhanced_metadata:
                         metadata_store[doc_id] = enhanced_metadata
                 
-                # Get embeddings from OpenAI API
+                # EMBEDDING GENERATION:
+                # Convert text content to vector embeddings using OpenAI API
+                # These vectors enable semantic similarity search
+                logger.debug(f"Generating embeddings for {len(texts)} documents")
                 embeddings = get_embeddings_batch(texts)
                 
-                # Add to ChromaDB
+                # DATABASE INSERTION:
+                # Add documents, embeddings, and metadata to ChromaDB
                 collection.add(
-                    ids=ids,
-                    embeddings=embeddings,
-                    documents=texts,
-                    metadatas=metadatas
+                    ids=ids,                 # Unique document identifiers
+                    embeddings=embeddings,   # Vector representations of content
+                    documents=texts,         # Original text content
+                    metadatas=metadatas      # Simple metadata for filtering
                 )
+                logger.debug(f"Added batch {batch_num} to vector database")
                 
-                # Sleep to avoid API rate limits
+                # RATE LIMITING:
+                # Pause between batches to avoid overwhelming the embedding API
+                # This helps prevent rate limit errors from the embedding provider
                 if i + batch_size < len(documents):
+                    logger.debug("Pausing to respect API rate limits")
                     time.sleep(1)
                 
             except Exception as e:
-                logger.error(f"Error indexing batch {i//batch_size + 1}/{total_batches}: {str(e)}")
+                # ERROR HANDLING:
+                # Log detailed error but continue with next batch
+                # This allows partial progress even if some batches fail
+                logger.error(f"Error indexing batch {batch_num}/{total_batches}: {str(e)}")
+                logger.debug(f"Batch size: {len(batch)}, First ID: {ids[0] if ids else 'N/A'}")
                 
+            # Update progress bar after each batch completes
             pbar.update(len(batch))
     
-    # Save metadata store
+    # METADATA PERSISTENCE:
+    # Save enhanced metadata store for future retrieval operations
+    # This complements the vector database by storing rich, complex metadata
     try:
+        logger.info(f"Saving metadata store with {len(metadata_store)} entries to {metadata_store_path}")
         with open(metadata_store_path, 'w', encoding='utf-8') as f:
             json.dump(metadata_store, f, indent=2)
     except Exception as e:
         logger.error(f"Error saving metadata store: {str(e)}")
+        logger.warning("Enhanced metadata may be lost or incomplete")
     
-    logger.info(f"Indexed {len(documents)} documents")
-
+    # COMPLETION SUMMARY:
+    # Log final indexing statistics
+    logger.info(f"Successfully indexed {len(documents)} documents in the vector database")
+    
 @task(
-    name="semantic_search",
-    description="Perform semantic search in the vector database"
+    name="semantic_search",                        # Task name displayed in Prefect UI
+    description="Perform semantic search in the vector database",
+    # No retries specified - search failures don't benefit as much from retries as API calls
+    # No caching configuration - searches should generally be fresh based on latest query
 )
 def semantic_search(query: str, 
                    client: chromadb.PersistentClient, 
                    db_dir: str,
-                   k: int = 5, 
+                   k: int = 5,                     # Number of results to retrieve
                    filter_labels: List[str] = None) -> List[Document]:
     """
-    Perform semantic search in the vector database with optional filtering.
+    Execute a semantic similarity search against the vector database to find
+    contextually relevant documents based on meaning rather than keyword matching.
+    Supports optional filtering by document labels for more targeted retrieval.
     
     Args:
-        query: Query text
-        client: ChromaDB client
-        db_dir: Directory where vector database is stored
-        k: Number of results to return
-        filter_labels: Optional list of labels to filter by
+        query: User's query text to find semantically similar documents for
+        client: Initialized ChromaDB client connected to the vector database
+        db_dir: Directory where vector database and enhanced metadata are stored
+        k: Maximum number of results to return (top-k retrieval)
+        filter_labels: Optional list of topic labels to filter results by
         
     Returns:
-        List of similar documents
+        List of Document objects containing the most relevant content and metadata
     """
+    # Get Prefect logger for structured task logging
     logger = get_run_logger()
     
-    # Get collection
+    # VECTOR DATABASE CONNECTION:
+    # Retrieve the collection that stores our document embeddings
+    # This is where all the vector representations and simple metadata are stored
+    logger.debug(f"Connecting to vector database collection 'rag_documents'")
     collection = client.get_collection("rag_documents")
     
-    # Get query embedding
+    # QUERY EMBEDDING GENERATION:
+    # Convert the textual query into the same vector space as our documents
+    # This transformation enables semantic matching rather than keyword matching
+    logger.debug(f"Generating embedding for query: '{query}'")
     query_embedding = get_embeddings([query])[0]
     
-    # Path for metadata store
+    # ENHANCED METADATA RETRIEVAL:
+    # Get path to the supplementary metadata store
+    # This contains complex metadata that couldn't be stored directly in ChromaDB
     metadata_store_path = os.path.join(db_dir, "metadata_store.json")
     
-    # Load metadata store
+    # Load the enhanced metadata store to access rich document information
+    # This includes complex structures like nested objects and detailed labels
     if os.path.exists(metadata_store_path):
         try:
+            logger.debug(f"Loading enhanced metadata from {metadata_store_path}")
             with open(metadata_store_path, 'r', encoding='utf-8') as f:
                 metadata_store = json.load(f)
+            logger.debug(f"Loaded metadata for {len(metadata_store)} documents")
         except Exception as e:
             logger.error(f"Error loading metadata store: {str(e)}")
+            logger.warning("Using empty metadata store due to loading error")
             metadata_store = {}
     else:
+        logger.warning(f"Metadata store not found at {metadata_store_path}")
+        logger.info("Enhanced metadata will not be available for search results")
         metadata_store = {}
     
+    # SEMANTIC SEARCH EXECUTION:
     try:
-        # Basic similarity search without filtering
+        # SEARCH STRATEGY SELECTION:
+        # Choose between basic semantic search and filtered semantic search
+        # based on whether the user specified label filters
         if not filter_labels:
+            # BASIC SIMILARITY SEARCH:
+            # Perform standard vector similarity search with no filtering
+            # This finds the k most semantically similar documents to the query
+            logger.info(f"Executing basic semantic search for query: '{query}'")
             results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=k,
-                include=["documents", "metadatas", "distances"]
+                query_embeddings=[query_embedding],  # Vector representation of query
+                n_results=k,                         # Number of results to retrieve
+                include=["documents", "metadatas", "distances"]  # Data to include in results
             )
+            logger.debug(f"Retrieved {len(results['documents'][0])} results from vector database")
         else:
-            # First get more results than needed to allow for filtering
+            # ENHANCED FILTERED SEARCH:
+            # Two-stage search with post-filtering for more targeted results
+            # First retrieves more candidates, then filters to the most relevant k
+            logger.info(f"Executing filtered semantic search with labels: {filter_labels}")
+            
+            # INITIAL OVER-RETRIEVAL:
+            # Get more results than needed to allow for filtering
+            # This compensates for results that might be filtered out
+            logger.debug(f"Retrieving {k*2} initial candidates for filtering")
             results = collection.query(
                 query_embeddings=[query_embedding],
-                n_results=k*2,
-                include=["documents", "metadatas", "distances", "ids"]
+                n_results=k*2,                      # Get twice as many results as needed
+                include=["documents", "metadatas", "distances", "ids"]  # Include IDs for metadata lookup
             )
             
-            # Filter results by labels
+            # POST-RETRIEVAL FILTERING:
+            # Filter retrieved documents based on specified labels
+            # This enables topic-focused retrieval from the semantic search results
+            logger.debug(f"Applying label filters: {filter_labels}")
             filtered_indices = []
+            filter_stats = {label: 0 for label in filter_labels}
+            
             for i, doc_id in enumerate(results['ids'][0]):
-                # Get enhanced metadata from store
+                # Get enhanced metadata from store for rich filtering
                 enhanced_metadata = metadata_store.get(doc_id, {})
                 doc_labels = enhanced_metadata.get('labels', [])
                 
                 # Check if any of the required labels are present
-                if any(label in doc_labels for label in filter_labels):
+                # This implements an OR relationship between filter labels
+                matches = [label for label in filter_labels if label in doc_labels]
+                if matches:
                     filtered_indices.append(i)
+                    for match in matches:
+                        filter_stats[match] += 1
                     
+                # Stop once we have enough filtered results
                 if len(filtered_indices) >= k:
                     break
             
-            # Filter results to only keep matches
+            # FILTER APPLICATION:
+            # Construct filtered result set based on label matching
+            logger.debug(f"Filter matches: {filter_stats}")
             if filtered_indices:
+                # Construct filtered result set by selecting matching indices
+                logger.info(f"Found {len(filtered_indices)} documents matching filter criteria")
                 results = {
                     'ids': [[results['ids'][0][i] for i in filtered_indices]],
                     'documents': [[results['documents'][0][i] for i in filtered_indices]],
@@ -1079,7 +1590,11 @@ def semantic_search(query: str,
                     'distances': [[results['distances'][0][i] for i in filtered_indices]]
                 }
             else:
-                # If no matches, limit to k results
+                # FALLBACK STRATEGY:
+                # If no documents match the filters, return unfiltered top-k results
+                # This ensures some results are returned even if filters are too restrictive
+                logger.warning(f"No documents matched the filter labels {filter_labels}")
+                logger.info("Returning unfiltered results as fallback")
                 results = {
                     'ids': [results['ids'][0][:k]],
                     'documents': [results['documents'][0][:k]],
@@ -1087,30 +1602,65 @@ def semantic_search(query: str,
                     'distances': [results['distances'][0][:k]]
                 }
         
-        # Convert results to Document objects
+        # RESULT CONSTRUCTION:
+        # Convert raw ChromaDB results into Document objects for downstream processing
+        # This standardizes the format and enriches with additional metadata
+        logger.debug(f"Converting {len(results['documents'][0])} results to Document objects")
         docs = []
         for i in range(len(results['documents'][0])):
+            # Get document ID for metadata lookup
             doc_id = results['ids'][0][i] if 'ids' in results else f"result_{i}"
             doc_text = results['documents'][0][i]
+            
+            # Get base metadata from ChromaDB (simple types only)
             doc_metadata = results['metadatas'][0][i].copy() if results['metadatas'][0][i] else {}
             
-            # Add enhanced metadata from store
+            # METADATA ENRICHMENT:
+            # Add enhanced metadata from separate store
+            # This reunites complex metadata with the search results
             if doc_id in metadata_store:
                 for key, value in metadata_store[doc_id].items():
                     doc_metadata[key] = value
             
-            # Create Document object
+            # Calculate semantic relevance score (lower distance = higher relevance)
+            relevance_score = 1.0 - min(results['distances'][0][i], 1.0)
+            doc_metadata['relevance_score'] = relevance_score
+            
+            # Create standardized Document object with content and metadata
             doc = Document(
                 page_content=doc_text,
                 metadata=doc_metadata
             )
             docs.append(doc)
         
+        # RELEVANCE ANALYSIS:
+        # Log information about the quality of search results
+        if docs and logger.isEnabledFor(logging.DEBUG):
+            distances = results['distances'][0]
+            logger.debug(f"Result distances - min: {min(distances):.4f}, " +
+                       f"max: {max(distances):.4f}, " +
+                       f"avg: {sum(distances)/len(distances):.4f}")
+            
+        logger.info(f"Semantic search completed with {len(docs)} results for query: '{query}'")
         return docs
     except Exception as e:
-        logger.error(f"Error in similarity search: {str(e)}")
+        # ERROR HANDLING:
+        # Comprehensive error handling to avoid pipeline failures
+        # Log detailed error but return empty results to allow pipeline to continue
+        logger.error(f"Error in semantic search: {type(e).__name__}: {str(e)}")
+        
+        # Provide more specific error information for common failure modes
+        if "not found" in str(e).lower():
+            logger.error("Collection may not exist - ensure database is properly initialized")
+        elif "dimension" in str(e).lower():
+            logger.error("Embedding dimension mismatch - check embedding model consistency")
+        elif "memory" in str(e).lower():
+            logger.error("Memory error - vector database may be too large for available memory")
+            
+        # Return empty results to ensure pipeline can continue
+        logger.warning("Returning empty results due to search error")
         return []
-
+    
 # ------------------------------
 # Query Engine Component
 # ------------------------------
@@ -1877,58 +2427,13 @@ def extract_keywords(text: str) -> List[str]:
                
     return keywords[:10]  # Return top 10 keywords
 
-def get_embeddings(texts: List[str]) -> List[List[float]]:
-    """
-    Get embeddings for a list of texts using OpenAI API.
-    
-    Args:
-        texts: List of texts to embed
-        
-    Returns:
-        List of embedding vectors
-    """
-    try:
-        response = openai.Embedding.create(
-            input=texts,
-            model="text-embedding-ada-002"
-        )
-        return [data.embedding for data in response.data]
-    except Exception as e:
-        print(f"Error getting embeddings: {str(e)}")
-        # Return zero embeddings as fallback
-        return [[0.0] * 1536 for _ in texts]
-
-def get_embeddings_batch(texts: List[str], batch_size: int = 20) -> List[List[float]]:
-    """
-    Get embeddings for a list of texts in batches to avoid API limits.
-    
-    Args:
-        texts: List of texts to embed
-        batch_size: Batch size for API calls
-        
-    Returns:
-        List of embedding vectors
-    """
-    all_embeddings = []
-    
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        batch_embeddings = get_embeddings(batch)
-        all_embeddings.extend(batch_embeddings)
-        
-        # Sleep to avoid rate limits
-        if i + batch_size < len(texts):
-            time.sleep(1)
-    
-    return all_embeddings
-
 # ------------------------------
 # Main Execution
 # ------------------------------
 
 if __name__ == "__main__":
     # OpenAI API key
-    openai.api_key = ""
+    openai.api_key = "YOUR_OPENAI_API_KEY_HERE"
     
     # Configuration
     config = {
@@ -1942,11 +2447,11 @@ if __name__ == "__main__":
     }
     
     # Run the pipeline
-    result = rag_pipeline("./documents/", config)
+    result = rag_pipeline("https://evolutionmining.com.au", config)
     
     # Query
     answer = query_rag_system(
-        "What are the key findings in the documents?",
+        "What did the mineral resources and ore reserves portfolio look like?",
         db_dir=result['db_dir']
     )
     
