@@ -15,12 +15,13 @@ import pandas as pd
 import camelot
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import chromadb
 from tqdm import tqdm
 import concurrent.futures
 from pydantic import BaseModel, Field
 from hashlib import sha256
 
+import faiss
+import pickle
 
 import torch
 from transformers import LlamaForCausalLM, LlamaTokenizer
@@ -30,6 +31,15 @@ from prefect import task, flow, get_run_logger
 from prefect.tasks import task_input_hash
 from prefect.utilities.annotations import quote
 from datetime import timedelta
+
+# Add necessary FAISS imports
+from pydantic import BaseModel, Field
+
+# Document class definition for compatibility
+class Document(BaseModel):
+    """Document with content and metadata for vector storage."""
+    page_content: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 # ------------------------------
 # Data Models for Structured Data
@@ -106,11 +116,238 @@ class Document(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 # ------------------------------
+# FAISS Vector Database Component
+# ------------------------------
+
+class FAISSVectorStore:
+    """FAISS Vector Database wrapper for storing and retrieving document embeddings."""
+    
+    def __init__(self, db_dir: str, dimension: int = 4096):
+        """
+        Initialize FAISS vector store.
+        
+        Args:
+            db_dir: Directory to store vector database
+            dimension: Dimension of the embedding vectors
+        """
+        self.db_dir = db_dir
+        self.dimension = dimension
+        
+        # Create directory if it doesn't exist
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir)
+            
+        self.index_file = os.path.join(db_dir, "faiss_index.bin")
+        self.documents_file = os.path.join(db_dir, "documents.pkl")
+        self.metadata_file = os.path.join(db_dir, "metadata_store.json")
+        
+        # Initialize or load index
+        self._initialize_index()
+        
+    def _initialize_index(self):
+        """Initialize or load FAISS index and associated data."""
+        if os.path.exists(self.index_file):
+            # Load existing index
+            self.index = faiss.read_index(self.index_file)
+            
+            # Load documents
+            with open(self.documents_file, 'rb') as f:
+                self.documents = pickle.load(f)
+                
+            # Load metadata store if it exists
+            if os.path.exists(self.metadata_file):
+                with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                    self.metadata_store = json.load(f)
+            else:
+                self.metadata_store = {}
+        else:
+            # Create new index
+            self.index = faiss.IndexFlatIP(self.dimension)  # Inner product (cosine after normalization)
+            self.documents = []  # List to store document texts
+            self.metadata_store = {}  # Dict to store document metadata
+    
+    def save(self):
+        """Save the index and associated data to disk."""
+        # Save FAISS index
+        faiss.write_index(self.index, self.index_file)
+        
+        # Save documents
+        with open(self.documents_file, 'wb') as f:
+            pickle.dump(self.documents, f)
+            
+        # Save metadata store
+        with open(self.metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(self.metadata_store, f, indent=2)
+    
+    def count(self):
+        """Return the number of documents in the index."""
+        return len(self.documents)
+    
+    def add(self, documents: List[str], embeddings: List[List[float]], 
+            metadatas: List[Dict[str, Any]], ids: List[str] = None):
+        """
+        Add documents and their embeddings to the index.
+        
+        Args:
+            documents: List of document texts
+            embeddings: List of embedding vectors
+            metadatas: List of metadata dictionaries
+            ids: Optional list of document IDs
+        """
+        if not documents or not embeddings:
+            return
+            
+        # Generate IDs if not provided
+        if ids is None:
+            ids = [f"doc_{i+len(self.documents)}" for i in range(len(documents))]
+            
+        # Convert embeddings to numpy array
+        embeddings_np = np.array(embeddings, dtype=np.float32)
+        
+        # Normalize vectors for cosine similarity
+        faiss.normalize_L2(embeddings_np)
+        
+        # Add to FAISS index
+        self.index.add(embeddings_np)
+        
+        # Store documents and their metadata
+        for i, (doc_id, document, metadata) in enumerate(zip(ids, documents, metadatas)):
+            # Store document
+            self.documents.append({
+                'id': doc_id,
+                'text': document,
+                'metadata': metadata
+            })
+            
+            # Store enhanced metadata separately
+            enhanced_metadata = {}
+            for key, value in metadata.items():
+                if isinstance(value, str) and (value.startswith('[') or value.startswith('{')):
+                    try:
+                        # Try to parse JSON strings back to Python objects
+                        enhanced_metadata[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        enhanced_metadata[key] = value
+                else:
+                    enhanced_metadata[key] = value
+                    
+            self.metadata_store[doc_id] = enhanced_metadata
+            
+        # Save the updated index and data
+        self.save()
+    
+    def search(self, embedding: List[float], k: int = 5, filter_labels: List[str] = None) -> Dict:
+        """
+        Search the index for documents similar to the query embedding.
+        
+        Args:
+            embedding: Query embedding vector
+            k: Number of results to return
+            filter_labels: Optional list of labels to filter results by
+            
+        Returns:
+            Dictionary with search results
+        """
+        if len(self.documents) == 0:
+            return {
+                'ids': [[]],
+                'documents': [[]],
+                'metadatas': [[]],
+                'distances': [[]]
+            }
+            
+        # Convert embedding to numpy array and normalize
+        query_embedding = np.array([embedding], dtype=np.float32)
+        faiss.normalize_L2(query_embedding)
+        
+        # Retrieve more results initially if filtering is needed
+        num_results = k * 3 if filter_labels else k
+        num_results = min(num_results, len(self.documents))
+        
+        # Search the index
+        distances, indices = self.index.search(query_embedding, num_results)
+        
+        # Convert distances to similarity scores (1 - distance)
+        # FAISS returns negative inner products for cosine similarity, so we negate
+        similarities = -distances
+        
+        # Prepare results
+        ids = []
+        documents = []
+        metadatas = []
+        filtered_indices = []
+        
+        # Apply label filtering if needed
+        if filter_labels:
+            filter_matches = {label: 0 for label in filter_labels}
+            
+            for i, idx in enumerate(indices[0]):
+                if idx < len(self.documents):
+                    doc = self.documents[idx]
+                    doc_id = doc['id']
+                    labels_found = False
+                    
+                    # Check document metadata for labels
+                    if 'labels' in doc['metadata']:
+                        doc_labels_str = doc['metadata']['labels']
+                        try:
+                            doc_labels = json.loads(doc_labels_str) if isinstance(doc_labels_str, str) else doc_labels_str
+                            matches = [label for label in filter_labels if label in doc_labels]
+                            if matches:
+                                filtered_indices.append(i)
+                                for match in matches:
+                                    filter_matches[match] += 1
+                                labels_found = True
+                        except json.JSONDecodeError:
+                            # If not valid JSON, treat as plain text
+                            if any(label in doc_labels_str for label in filter_labels):
+                                filtered_indices.append(i)
+                                labels_found = True
+                    
+                    # Check enhanced metadata if available
+                    if not labels_found and doc_id in self.metadata_store:
+                        enhanced_metadata = self.metadata_store[doc_id]
+                        if 'labels' in enhanced_metadata:
+                            doc_labels = enhanced_metadata['labels']
+                            matches = [label for label in filter_labels if label in doc_labels]
+                            if matches:
+                                filtered_indices.append(i)
+                                for match in matches:
+                                    filter_matches[match] += 1
+                                    
+                    # Limit to top-k results
+                    if len(filtered_indices) >= k:
+                        break
+            
+            # If no documents match filters, use unfiltered results
+            if not filtered_indices:
+                filtered_indices = list(range(min(k, len(indices[0]))))
+        else:
+            # No filtering, use all results up to k
+            filtered_indices = list(range(min(k, len(indices[0]))))
+        
+        # Collect final results
+        for i in filtered_indices:
+            idx = indices[0][i]
+            if idx < len(self.documents):
+                doc = self.documents[idx]
+                ids.append(doc['id'])
+                documents.append(doc['text'])
+                metadatas.append(doc['metadata'])
+        
+        return {
+            'ids': [ids],
+            'documents': [documents],
+            'metadatas': [metadatas],
+            'distances': [[similarities[0][i] for i in filtered_indices]]
+        }
+    
+# ------------------------------
 # Llama Model Configuration
 # ------------------------------
 
 class LlamaConfig:
-    """Configuration for Meta Llama models."""
+    """Configuration for Meta Llama models with robust loading and fallback strategies."""
     # Model paths to Meta model directories
     LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH", "/models/Llama3.2-3B")
     
@@ -118,31 +355,126 @@ class LlamaConfig:
     _model = None
     _tokenizer = None
     
+    # Configure model parameters
+    GENERATION_MAX_TOKENS = 512
+    GENERATION_TEMPERATURE = 0.7
+    
     @classmethod
     def get_model(cls):
+        """
+        Load and return the Meta Llama model and tokenizer.
+        
+        Returns:
+            Tuple of (model, tokenizer)
+            
+        Raises:
+            RuntimeError: If model loading fails
+        """
         if cls._model is None:
+            logger = logging.getLogger(__name__)
+            logger.info(f"Loading Meta Llama model from {cls.LLAMA_MODEL_PATH}")
+            
             try:
-                # Load the tokenizer
-                cls._tokenizer = LlamaTokenizer.from_pretrained(
-                    cls.LLAMA_MODEL_PATH,
-                    local_files_only=True,  # This tells the library to only look for files locally
-                    trust_remote_code=True,  # This allows the model to run any custom code that might be included in the model files
-                    repo_type="local"  # This specifies that the model is stored locally
-                )
+                # Try approach 1: Use AutoModelForCausalLM (most flexible)
+                try:
+                    from transformers import AutoModelForCausalLM, AutoTokenizer
+                    
+                    logger.info("Attempting to load model with AutoClasses")
+                    cls._tokenizer = AutoTokenizer.from_pretrained(
+                        cls.LLAMA_MODEL_PATH,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    
+                    cls._model = AutoModelForCausalLM.from_pretrained(
+                        cls.LLAMA_MODEL_PATH,
+                        torch_dtype=torch.float16,
+                        device_map="auto",
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    logger.info("Successfully loaded model with AutoClasses")
+                    return cls._model, cls._tokenizer
+                except Exception as auto_err:
+                    logger.warning(f"Failed to load with AutoClasses: {str(auto_err)}")
+                    
+                # Try approach 2: Use LlamaForCausalLM directly
+                try:
+                    from transformers import LlamaTokenizer, LlamaForCausalLM
+                    
+                    logger.info("Attempting to load model with LlamaForCausalLM directly")
+                    cls._tokenizer = LlamaTokenizer.from_pretrained(
+                        cls.LLAMA_MODEL_PATH,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    
+                    cls._model = LlamaForCausalLM.from_pretrained(
+                        cls.LLAMA_MODEL_PATH,
+                        torch_dtype=torch.float16,
+                        device_map="auto",
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    logger.info("Successfully loaded model with LlamaForCausalLM")
+                    return cls._model, cls._tokenizer
+                except Exception as llama_err:
+                    logger.warning(f"Failed to load with LlamaForCausalLM: {str(llama_err)}")
                 
-                # Load the model
-                cls._model = LlamaForCausalLM.from_pretrained(
-                    cls.LLAMA_MODEL_PATH,
-                    torch_dtype=torch.float16,  # Use half precision for memory efficiency
-                    device_map="auto",  # Automatically choose the best device
-                    local_files_only=True,  # This tells the library to only look for files locally
-                    trust_remote_code=True,  # This allows the model to run any custom code that might be included in the model files
-                    repo_type="local"  # This specifies that the model is stored locally
-                )
+                # Try approach 3: Load with explicit path handling
+                try:
+                    import os
+                    from transformers import AutoModelForCausalLM, AutoTokenizer
+                    
+                    logger.info("Attempting to load model with explicit path handling")
+                    # Check if the path exists
+                    if not os.path.exists(cls.LLAMA_MODEL_PATH):
+                        raise ValueError(f"Model path does not exist: {cls.LLAMA_MODEL_PATH}")
+                    
+                    # List files in the directory to help debug
+                    files = os.listdir(cls.LLAMA_MODEL_PATH)
+                    logger.info(f"Files in model directory: {files}")
+                    
+                    # Load with from_pretrained with explicit path handling
+                    cls._tokenizer = AutoTokenizer.from_pretrained(
+                        cls.LLAMA_MODEL_PATH,
+                        use_fast=False,  # Try disabling fast tokenizer
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    
+                    # Load model with more conservative settings
+                    cls._model = AutoModelForCausalLM.from_pretrained(
+                        cls.LLAMA_MODEL_PATH,
+                        torch_dtype=torch.float16,
+                        low_cpu_mem_usage=True,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    logger.info("Successfully loaded model with explicit path handling")
+                    return cls._model, cls._tokenizer
+                except Exception as path_err:
+                    logger.warning(f"Failed to load with explicit path handling: {str(path_err)}")
+                
+                # All approaches failed
+                raise RuntimeError("All model loading approaches failed")
+                
             except Exception as e:
-                logging.error(f"Error loading Meta Llama model: {str(e)}")
-                raise
+                error_msg = f"Error loading Meta Llama model: {str(e)}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+        
         return cls._model, cls._tokenizer
+    
+    @classmethod
+    def get_embedding_dimension(cls):
+        """Get the embedding dimension for the model."""
+        try:
+            model, _ = cls.get_model()
+            return model.config.hidden_size
+        except Exception:
+            # Return default embedding dimension for Llama models
+            return 4096
 
 # ------------------------------
 # Web Scraper Component
@@ -1023,19 +1355,20 @@ def chunk_documents(processed_metadata: Dict[str, Dict],
 
 @task(
     name="initialize_vector_db",
-    description="Initialize or load the vector database",
+    description="Initialize or load the FAISS vector database",
     retries=2,
     retry_delay_seconds=15
 )
-def initialize_vector_db(db_dir: str) -> chromadb.PersistentClient:
+def initialize_vector_db(db_dir: str, dimension: int = 4096) -> FAISSVectorStore:
     """
-    Initialize or load the vector database.
+    Initialize or load the FAISS vector database.
     
     Args:
         db_dir: Directory to store vector database
+        dimension: Dimension of the embedding vectors
         
     Returns:
-        Initialized vector database client
+        Initialized FAISS vector store
     """
     logger = get_run_logger()
     
@@ -1043,19 +1376,13 @@ def initialize_vector_db(db_dir: str) -> chromadb.PersistentClient:
     if not os.path.exists(db_dir):
         os.makedirs(db_dir)
     
-    # Initialize ChromaDB client
-    client = chromadb.PersistentClient(path=db_dir)
-    
-    # Get or create the collection for documents
     try:
-        collection = client.get_or_create_collection(
-            name="msi_documents",
-            metadata={"hnsw:space": "cosine"}  # Using cosine similarity
-        )
-        logger.info(f"Initialized vector database at {db_dir}")
-        return client
+        # Initialize FAISS vector store
+        vector_store = FAISSVectorStore(db_dir, dimension)
+        logger.info(f"Initialized FAISS vector database at {db_dir}")
+        return vector_store
     except Exception as e:
-        logger.error(f"Error initializing vector database: {str(e)}")
+        logger.error(f"Error initializing FAISS vector database: {str(e)}")
         raise
 
 def embedding_cache_key_fn(context, parameters):
@@ -1511,62 +1838,33 @@ def get_embeddings_batch(texts: List[str],
     return all_embeddings
 
 @task(
-    name="embed_and_index_documents",                  # Task name displayed in Prefect UI
-    description="Create embeddings and index documents in vector database",
-    cache_key_fn=embedding_cache_key_fn,               # Custom cache key function for caching
-    cache_expiration=timedelta(hours=24),              # Cache results for 24 hours
-    retries=2,                                         # Retry twice in case of API failures or network issues
-    retry_delay_seconds=30                             # 30-second pause between retries to avoid overwhelming APIs
+    name="embed_and_index_documents",
+    description="Create embeddings and index documents in FAISS vector database",
+    cache_key_fn=embedding_cache_key_fn,
+    cache_expiration=timedelta(hours=24),
+    retries=2,
+    retry_delay_seconds=30
 )
 def embed_and_index_documents(documents: List[Document], 
-                             client: chromadb.PersistentClient, 
+                             vector_store: FAISSVectorStore, 
                              db_dir: str,
                              batch_size: int = 32) -> None:
     """
-    Generate embeddings for chunked documents and store them in the vector database
-    along with their metadata. This function handles the semantic conversion of text
-    into vector representations while managing API rate limits and metadata complexity.
+    Generate embeddings for chunked documents and store them in the FAISS vector database
+    along with their metadata.
     
     Args:
         documents: List of chunked Document objects ready for embedding and indexing
-        client: Initialized ChromaDB client connected to the vector database
+        vector_store: Initialized FAISS vector store
         db_dir: Directory where vector database and metadata are stored
-        batch_size: Number of documents to process in each batch (controls API usage)
+        batch_size: Number of documents to process in each batch
     """
     # Get Prefect logger for structured task logging
     logger = get_run_logger()
-    logger.info(f"Indexing {len(documents)} documents in vector database")
-    
-    # DATABASE INITIALIZATION:
-    # Get or create the collection for storing document embeddings
-    # This is the primary storage for the vector search capabilities
-    collection = client.get_collection("msi_documents")
-    logger.debug(f"Connected to ChromaDB collection: msi_documents")
-    
-    # METADATA STORAGE SETUP:
-    # ChromaDB has limitations on metadata complexity, so we use a separate
-    # JSON store for complex metadata structures (nested objects, arrays, etc.)
-    metadata_store_path = os.path.join(db_dir, "metadata_store.json")
-    
-    # Load existing metadata store if available to preserve previous metadata
-    # This allows incremental updates without losing previously stored metadata
-    if os.path.exists(metadata_store_path):
-        try:
-            logger.debug(f"Loading existing metadata store from {metadata_store_path}")
-            with open(metadata_store_path, 'r', encoding='utf-8') as f:
-                metadata_store = json.load(f)
-            logger.debug(f"Loaded metadata for {len(metadata_store)} existing documents")
-        except Exception as e:
-            logger.error(f"Error loading metadata store: {str(e)}")
-            logger.warning("Creating new metadata store due to loading error")
-            metadata_store = {}
-    else:
-        logger.info("No existing metadata store found, creating new one")
-        metadata_store = {}
+    logger.info(f"Indexing {len(documents)} documents in FAISS vector database")
     
     # BATCH PROCESSING SETUP:
     # Calculate number of batches for progress tracking and rate limiting
-    # This helps manage memory usage and API rate limits
     total_batches = (len(documents) + batch_size - 1) // batch_size
     logger.info(f"Processing in {total_batches} batches of up to {batch_size} documents each")
     
@@ -1582,74 +1880,60 @@ def embed_and_index_documents(documents: List[Document],
                 # DOCUMENT PREPARATION:
                 # Prepare document data for indexing in vector database
                 # Generate unique IDs for each document in the batch
-                # These IDs must be stable across runs for proper incremental updates
                 ids = [f"doc_{i+j}" for j in range(len(batch))]
                 
                 # Extract text content from documents for embedding generation
                 texts = [doc.page_content for doc in batch]
                 
                 # METADATA HANDLING:
-                # Split metadata into "simple" types (stored directly in ChromaDB)
-                # and "complex" types (stored in separate JSON metadata store)
-                # This works around ChromaDB's limitations on metadata complexity
                 metadatas = []
                 
                 for j, doc in enumerate(batch):
                     doc_id = ids[j]
                     
-                    # Separate metadata into simple and complex types
-                    simple_metadata = {}   # Goes directly into ChromaDB
-                    enhanced_metadata = {} # Goes into separate metadata store
+                    # Process metadata
+                    metadata = {}
                     
                     # Process each metadata field according to its type
                     for key, value in doc.metadata.items():
                         # For lists, convert to string representation
                         if isinstance(value, list):
-                            # Convert list to string representation for ChromaDB
-                            simple_metadata[key] = json.dumps(value)  # Convert list to JSON string
-                            enhanced_metadata[key] = value  # Keep original in enhanced metadata
-                        # SIMPLE TYPES: Store directly in ChromaDB for filtering
+                            # Convert list to string representation for storage
+                            metadata[key] = json.dumps(value)
+                        # SIMPLE TYPES: Store directly
                         elif isinstance(value, (str, int, float, bool)):
-                            simple_metadata[key] = value
-                        # COMPLEX TYPES: Store in separate metadata store
+                            metadata[key] = value
+                        # COMPLEX TYPES: Store as JSON string
                         elif isinstance(value, dict):
-                            simple_metadata[key] = json.dumps(value)  # Convert dict to JSON string
-                            enhanced_metadata[key] = value  # Keep original in enhanced metadata
+                            metadata[key] = json.dumps(value)
                         # For any other types, convert to string
                         else:
                             try:
-                                simple_metadata[key] = str(value)
-                                enhanced_metadata[key] = value
+                                metadata[key] = str(value)
                             except:
                                 # If conversion fails, skip this metadata
                                 logger.warning(f"Skipping metadata key {key} with unsupported type {type(value)}")
                     
-                    # Add simple metadata to ChromaDB batch
-                    metadatas.append(simple_metadata)
-                    
-                    # Store enhanced metadata separately if present
-                    if enhanced_metadata:
-                        metadata_store[doc_id] = enhanced_metadata
+                    # Add metadata to batch
+                    metadatas.append(metadata)
                 
                 # EMBEDDING GENERATION:
-                # Convert text content to vector embeddings using Llama model
-                # These vectors enable semantic similarity search
+                # Convert text content to vector embeddings
                 logger.debug(f"Generating embeddings for {len(texts)} documents")
-                embeddings = get_embeddings_batch(texts, batch_size=min(batch_size, 8))  # Smaller batch size for Llama
+                embeddings = get_embeddings_batch(texts, batch_size=min(batch_size, 8))
                 
                 # DATABASE INSERTION:
-                # Add documents, embeddings, and metadata to ChromaDB
-                collection.add(
-                    ids=ids,                 # Unique document identifiers
-                    embeddings=embeddings,   # Vector representations of content
-                    documents=texts,         # Original text content
-                    metadatas=metadatas      # Simple metadata for filtering
+                # Add documents, embeddings, and metadata to FAISS
+                vector_store.add(
+                    ids=ids,
+                    documents=texts,
+                    embeddings=embeddings,
+                    metadatas=metadatas
                 )
-                logger.debug(f"Added batch {batch_num} to vector database")
+                logger.debug(f"Added batch {batch_num} to FAISS vector database")
                 
                 # MEMORY MANAGEMENT:
                 # Pause between batches to allow memory to be reclaimed
-                # This helps prevent out-of-memory errors with Llama models
                 if i + batch_size < len(documents):
                     logger.debug("Pausing to allow memory reclamation")
                     time.sleep(1)
@@ -1661,7 +1945,6 @@ def embed_and_index_documents(documents: List[Document],
             except Exception as e:
                 # ERROR HANDLING:
                 # Log detailed error but continue with next batch
-                # This allows partial progress even if some batches fail
                 logger.error(f"Error indexing batch {batch_num}/{total_batches}: {str(e)}")
                 logger.debug(f"Batch size: {len(batch)}, First ID: {ids[0] if ids else 'N/A'}")
                 
@@ -1673,20 +1956,9 @@ def embed_and_index_documents(documents: List[Document],
             # Update progress bar after each batch completes
             pbar.update(len(batch))
     
-    # METADATA PERSISTENCE:
-    # Save enhanced metadata store for future retrieval operations
-    # This complements the vector database by storing rich, complex metadata
-    try:
-        logger.info(f"Saving metadata store with {len(metadata_store)} entries to {metadata_store_path}")
-        with open(metadata_store_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata_store, f, indent=2)
-    except Exception as e:
-        logger.error(f"Error saving metadata store: {str(e)}")
-        logger.warning("Enhanced metadata may be lost or incomplete")
-    
     # COMPLETION SUMMARY:
     # Log final indexing statistics
-    logger.info(f"Successfully indexed {len(documents)} documents in the vector database")
+    logger.info(f"Successfully indexed {len(documents)} documents in the FAISS vector database")
 
 def search_cache_key_fn(context, parameters):
     """
@@ -1713,27 +1985,23 @@ def search_cache_key_fn(context, parameters):
     return key_hash.hexdigest()
     
 @task(
-    name="semantic_search",                        # Task name displayed in Prefect UI
-    description="Perform semantic search in the vector database",
-    # No retries specified - search failures don't benefit as much from retries as API calls
-    # cache_key_fn=search_cache_key_fn,             # Use custom cache key function
-    # cache_expiration=timedelta(minutes=30)        # Cache results for 30 minutes
+    name="semantic_search",
+    description="Perform semantic search in the FAISS vector database"
 )
 def semantic_search(query: str, 
-                   client: chromadb.PersistentClient, 
+                   vector_store: FAISSVectorStore, 
                    db_dir: str,
-                   k: int = 5,                     # Number of results to retrieve
+                   k: int = 5,
                    filter_labels: List[str] = None) -> List[Document]:
     """
-    Execute a semantic similarity search against the vector database to find
+    Execute a semantic similarity search against the FAISS vector database to find
     contextually relevant documents based on meaning rather than keyword matching.
-    Supports optional filtering by document labels for more targeted retrieval.
     
     Args:
         query: User's query text to find semantically similar documents for
-        client: Initialized ChromaDB client connected to the vector database
+        vector_store: Initialized FAISS vector store
         db_dir: Directory where vector database and enhanced metadata are stored
-        k: Maximum number of results to return (top-k retrieval)
+        k: Maximum number of results to return
         filter_labels: Optional list of topic labels to filter results by
         
     Returns:
@@ -1742,15 +2010,9 @@ def semantic_search(query: str,
     # Get Prefect logger for structured task logging
     logger = get_run_logger()
     
-    # VECTOR DATABASE CONNECTION:
-    # Retrieve the collection that stores our document embeddings
-    # This is where all the vector representations and simple metadata are stored
-    logger.debug(f"Connecting to vector database collection 'msi_documents'")
-    collection = client.get_collection("msi_documents")
-    
-    # Log the count of documents in collection
-    doc_count = collection.count()
-    logger.info(f"Collection contains {doc_count} documents")
+    # Log the count of documents in vector store
+    doc_count = vector_store.count()
+    logger.info(f"Vector store contains {doc_count} documents")
     
     if doc_count == 0:
         logger.warning("Vector database is empty. No documents to search.")
@@ -1758,149 +2020,31 @@ def semantic_search(query: str,
     
     # QUERY EMBEDDING GENERATION:
     # Convert the textual query into the same vector space as our documents
-    # This transformation enables semantic matching rather than keyword matching
     logger.debug(f"Generating embedding for query: '{query}'")
     query_embedding = get_embeddings([query])[0]
     
-    # ENHANCED METADATA RETRIEVAL:
-    # Get path to the supplementary metadata store
-    # This contains complex metadata that couldn't be stored directly in ChromaDB
-    metadata_store_path = os.path.join(db_dir, "metadata_store.json")
-    
-    # Load the enhanced metadata store to access rich document information
-    # This includes complex structures like nested objects and detailed labels
-    if os.path.exists(metadata_store_path):
-        try:
-            logger.debug(f"Loading enhanced metadata from {metadata_store_path}")
-            with open(metadata_store_path, 'r', encoding='utf-8') as f:
-                metadata_store = json.load(f)
-            logger.debug(f"Loaded metadata for {len(metadata_store)} documents")
-        except Exception as e:
-            logger.error(f"Error loading metadata store: {str(e)}")
-            logger.warning("Using empty metadata store due to loading error")
-            metadata_store = {}
-    else:
-        logger.warning(f"Metadata store not found at {metadata_store_path}")
-        logger.info("Enhanced metadata will not be available for search results")
-        metadata_store = {}
-    
     # SEMANTIC SEARCH EXECUTION:
     try:
-        # SEARCH STRATEGY SELECTION:
-        # Choose between basic semantic search and filtered semantic search
-        # based on whether the user specified label filters
-        if not filter_labels:
-            # BASIC SIMILARITY SEARCH:
-            # Perform standard vector similarity search with no filtering
-            # This finds the k most semantically similar documents to the query
-            logger.info(f"Executing basic semantic search for query: '{query}'")
-            results = collection.query(
-                query_embeddings=[query_embedding],  # Vector representation of query
-                n_results=k,                         # Number of results to retrieve
-                include=["documents", "metadatas", "distances", "ids"]  # Data to include in results
-            )
-            logger.debug(f"Retrieved {len(results['documents'][0])} results from vector database")
-        else:
-            # ENHANCED FILTERED SEARCH:
-            # Two-stage search with post-filtering for more targeted results
-            # First retrieves more candidates, then filters to the most relevant k
-            logger.info(f"Executing filtered semantic search with labels: {filter_labels}")
+        # Perform search in FAISS
+        logger.info(f"Executing semantic search for query: '{query}'")
+        if filter_labels:
+            logger.info(f"Applying label filters: {filter_labels}")
             
-            # Convert filter_labels to JSON string format for comparison with stored values
-            filter_labels_json = json.dumps(filter_labels)
-            logger.debug(f"Filter labels JSON: {filter_labels_json}")
-            
-            # INITIAL OVER-RETRIEVAL:
-            # Get more results than needed to allow for filtering
-            # This compensates for results that might be filtered out
-            logger.debug(f"Retrieving {k*3} initial candidates for filtering")
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=k*3,                      # Get more results initially
-                include=["documents", "metadatas", "distances", "ids"]  # Include IDs for metadata lookup
-            )
-            
-            # POST-RETRIEVAL FILTERING:
-            # Filter retrieved documents based on specified labels
-            # This enables topic-focused retrieval from the semantic search results
-            logger.debug(f"Applying label filters: {filter_labels}")
-            filtered_indices = []
-            filter_stats = {label: 0 for label in filter_labels}
-            
-            for i, doc_id in enumerate(results['ids'][0]):
-                # First check if 'labels' is in the simple metadata
-                doc_metadata = results['metadatas'][0][i]
-                
-                # Check for labels in metadata (stored as JSON string)
-                labels_found = False
-                if 'labels' in doc_metadata:
-                    try:
-                        # Try to parse the JSON string
-                        doc_labels = json.loads(doc_metadata['labels'])
-                        # Check if any required label matches
-                        matches = [label for label in filter_labels if label in doc_labels]
-                        if matches:
-                            filtered_indices.append(i)
-                            for match in matches:
-                                filter_stats[match] += 1
-                            labels_found = True
-                    except json.JSONDecodeError:
-                        # If not valid JSON, treat as plain text
-                        if any(label in doc_metadata['labels'] for label in filter_labels):
-                            filtered_indices.append(i)
-                            labels_found = True
-                
-                # If not found in simple metadata, check enhanced metadata
-                if not labels_found and doc_id in metadata_store:
-                    enhanced_metadata = metadata_store[doc_id]
-                    if 'labels' in enhanced_metadata:
-                        doc_labels = enhanced_metadata['labels']
-                        matches = [label for label in filter_labels if label in doc_labels]
-                        if matches:
-                            filtered_indices.append(i)
-                            for match in matches:
-                                filter_stats[match] += 1
-                    
-                # Stop once we have enough filtered results
-                if len(filtered_indices) >= k:
-                    break
-                    
-            # FILTER APPLICATION:
-            # Construct filtered result set based on label matching
-            logger.debug(f"Filter matches: {filter_stats}")
-            if filtered_indices:
-                # Construct filtered result set by selecting matching indices
-                logger.info(f"Found {len(filtered_indices)} documents matching filter criteria")
-                results = {
-                    'ids': [[results['ids'][0][i] for i in filtered_indices]],
-                    'documents': [[results['documents'][0][i] for i in filtered_indices]],
-                    'metadatas': [[results['metadatas'][0][i] for i in filtered_indices]],
-                    'distances': [[results['distances'][0][i] for i in filtered_indices]]
-                }
-            else:
-                # FALLBACK STRATEGY:
-                # If no documents match the filters, return unfiltered top-k results
-                # This ensures some results are returned even if filters are too restrictive
-                logger.warning(f"No documents matched the filter labels {filter_labels}")
-                logger.info("Returning unfiltered results as fallback")
-                results = {
-                    'ids': [results['ids'][0][:k]],
-                    'documents': [results['documents'][0][:k]],
-                    'metadatas': [results['metadatas'][0][:k]],
-                    'distances': [results['distances'][0][:k]]
-                }
+        results = vector_store.search(
+            embedding=query_embedding,
+            k=k,
+            filter_labels=filter_labels
+        )
         
         # RESULT CONSTRUCTION:
-        # Convert raw ChromaDB results into Document objects for downstream processing
-        # This standardizes the format and enriches with additional metadata
+        # Convert raw FAISS results into Document objects for downstream processing
         logger.debug(f"Converting {len(results['documents'][0])} results to Document objects")
         docs = []
+        
         for i in range(len(results['documents'][0])):
-            # Get document ID for metadata lookup
+            # Get document data
             doc_id = results['ids'][0][i] if 'ids' in results else f"result_{i}"
             doc_text = results['documents'][0][i]
-            
-            # Get base metadata from ChromaDB (simple types only)
             doc_metadata = results['metadatas'][0][i].copy() if results['metadatas'][0][i] else {}
             
             # METADATA PARSING:
@@ -1915,15 +2059,14 @@ def semantic_search(query: str,
                         pass
             
             # METADATA ENRICHMENT:
-            # Add enhanced metadata from separate store
-            # This reunites complex metadata with the search results
-            if doc_id in metadata_store:
-                for key, value in metadata_store[doc_id].items():
+            # Add enhanced metadata from vector store
+            if hasattr(vector_store, 'metadata_store') and doc_id in vector_store.metadata_store:
+                for key, value in vector_store.metadata_store[doc_id].items():
                     doc_metadata[key] = value
             
-            # Calculate semantic relevance score (lower distance = higher relevance)
-            relevance_score = 1.0 - min(results['distances'][0][i], 1.0)
-            doc_metadata['relevance_score'] = relevance_score
+            # Add relevance score
+            distance = results['distances'][0][i] if i < len(results['distances'][0]) else 0
+            doc_metadata['relevance_score'] = distance
             
             # Create standardized Document object with content and metadata
             doc = Document(
@@ -1932,34 +2075,15 @@ def semantic_search(query: str,
             )
             docs.append(doc)
         
-        # RELEVANCE ANALYSIS:
-        # Log information about the quality of search results
-        if docs and logger.isEnabledFor(logging.DEBUG):
-            distances = results['distances'][0]
-            logger.debug(f"Result distances - min: {min(distances):.4f}, " +
-                       f"max: {max(distances):.4f}, " +
-                       f"avg: {sum(distances)/len(distances):.4f}")
-            
         logger.info(f"Semantic search completed with {len(docs)} results for query: '{query}'")
         return docs
+        
     except Exception as e:
         # ERROR HANDLING:
-        # Comprehensive error handling to avoid pipeline failures
-        # Log detailed error but return empty results to allow pipeline to continue
         logger.error(f"Error in semantic search: {type(e).__name__}: {str(e)}")
-        
-        # Provide more specific error information for common failure modes
-        if "not found" in str(e).lower():
-            logger.error("Collection may not exist - ensure database is properly initialized")
-        elif "dimension" in str(e).lower():
-            logger.error("Embedding dimension mismatch - check embedding model consistency")
-        elif "memory" in str(e).lower():
-            logger.error("Memory error - vector database may be too large for available memory")
-            
-        # Return empty results to ensure pipeline can continue
         logger.warning("Returning empty results due to search error")
         return []
-    
+        
 # ------------------------------
 # Query Engine Component
 # ------------------------------
@@ -2151,14 +2275,15 @@ Question: {query} [/INST]"""
         
         return f"An error occurred while generating the answer: {str(e)}"
     
+# Update the process_query function to use our new FAISS vector store
 @task(
     name="process_query",
     description="Process a user query and generate an answer",
-    cache_key_fn=query_cache_key_fn,                    # Custom cache key function for caching
-    cache_expiration=timedelta(hours=24)                # Cache results for 24 hours
+    cache_key_fn=query_cache_key_fn,
+    cache_expiration=timedelta(hours=24)
 )
 def process_query(query: str, 
-                 client: chromadb.PersistentClient,
+                 vector_store: FAISSVectorStore,
                  db_dir: str,
                  topic_definitions: Dict[str, str],
                  k: int = 5,
@@ -2168,7 +2293,7 @@ def process_query(query: str,
     
     Args:
         query: Query text
-        client: ChromaDB client
+        vector_store: FAISS vector store
         db_dir: Directory where vector database is stored
         topic_definitions: Dictionary of topic definitions for classification
         k: Number of context documents to retrieve
@@ -2178,66 +2303,38 @@ def process_query(query: str,
         Dictionary with query results, sources, and structured data
     """
     logger = get_run_logger()
-    logger.info(f"Processing query: {query}")
+    logger.info(f"Processing query: '{query}'")
 
-
-
-    # Add this to check if documents exist in the collection
-    collection = client.get_collection("msi_documents")
-    count = collection.count()
+    # Check if documents exist in the vector store
+    count = vector_store.count()
     logger.info(f"Documents in vector database: {count}")
 
-    # Try a direct ChromaDB query outside the semantic search function to check 
-    # if the issue is with the database or the embedding
-    try:
-        # Try a basic query without embeddings (just get first k documents)
-        test_results = collection.get(limit=k, include=["documents", "metadatas"])
-        logger.info(f"Direct ChromaDB get returned {len(test_results['documents'])} documents")
-        
-        if test_results['documents']:
-            logger.info(f"Sample document: {test_results['documents'][0][:100]}...")
-        else:
-            logger.warning("No documents found in direct ChromaDB get")
-    except Exception as e:
-        logger.error(f"Error in direct ChromaDB test: {str(e)}")
-    
+    # Check if vector store is empty
+    if count == 0:
+        return {
+            'query': query,
+            'answer': "There are no documents in the vector database to search.",
+            'sources': [],
+            'topics': []
+        }
+
     # Step 1: Classify query into topics for targeted retrieval
     query_topics = classify_query(query, topic_definitions)
     logger.info(f"Query topics: {query_topics}")
 
-    # Check if query classification is working properly
-    if not query_topics:
-        logger.warning("No topics identified for query - this might affect retrieval")
-        # Try a basic similarity check against topic definitions
-        for topic, definition in topic_definitions.items():
-            # Simple word overlap check
-            query_words = set(query.lower().split())
-            topic_words = set(definition.lower().split())
-            overlap = len(query_words.intersection(topic_words))
-            logger.debug(f"Topic '{topic}' word overlap: {overlap}")
-    
-    # Check if embeddings are being generated correctly
+    # Testing embedding generation
     logger.info("Testing embedding generation...")
     test_embeddings = get_embeddings([query])
     logger.info(f"Test embedding dimension: {len(test_embeddings[0])}")
 
     # Step 2: Get context documents, filtered by topic if available
-    # logger.info("Testing search without topic filtering")
-    # context_docs = semantic_search(query, client, db_dir, k=k)
-    
-    # # If still empty after bypassing filters, there's a deeper issue
-    # if not context_docs:
-    #     logger.warning("Context documents still empty after bypassing topic filtering")
-
-
     if query_topics and use_structured_data:
         context_docs = semantic_search(
-            query, client, db_dir, k=k, filter_labels=query_topics
+            query, vector_store, db_dir, k=k, filter_labels=query_topics
         )
-        
     else:
-        logger.warning("No results with topic filtering, trying without filters")
-        context_docs = semantic_search(query, client, db_dir, k=k)
+        logger.info("Searching without topic filtering")
+        context_docs = semantic_search(query, vector_store, db_dir, k=k)
     
     # Handle case where no relevant documents are found
     if not context_docs:
@@ -2466,7 +2563,7 @@ def query_msi_system(query: str, db_dir: str = "vector_db", k: int = 5):
     # Process the query
     result = process_query(
         query=query,
-        client=client,
+        vector_store=client,  # Using the initialized client variable
         db_dir=db_dir,
         topic_definitions=topic_definitions,
         k=k
