@@ -228,7 +228,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Contact
 
-For questions or support, please [open an issue](https://github.com/yourusername/AIPoweredInsightsExtractionEngine/issues) or contact me (chrissimusokwe).
+For questions or support, please [open an issue](https://github.com/chrissimusokwe/AIPoweredInsightsExtractionEngine/issues) or contact me (chrissimusokwe).
 
 ---
 
