@@ -108,7 +108,7 @@ Structured Pydantic models for:
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/AIPoweredInsightsExtractionEngine.git
+   git clone https://github.com/chrissimusokwe/AIPoweredInsightsExtractionEngine.git
    cd AIPoweredInsightsExtractionEngine
    ```
 
